@@ -23,6 +23,7 @@
 #include <libplacebo/colorspace.h>
 #include <libplacebo/options.h>
 #include <libplacebo/renderer.h>
+#include <libplacebo/ml_render.h>
 #include <libplacebo/shaders/lut.h>
 #include <libplacebo/shaders/icc.h>
 #include <libplacebo/utils/libav.h>
@@ -143,6 +144,12 @@ struct priv {
     struct mp_csp_equalizer_state *video_eq;
     struct scaler_params scalers[SCALER_COUNT];
     const struct pl_hook **hooks; // storage for `params.hooks`
+    const struct pl_hook **active_hooks;
+    struct pl_hook ml_hooks[3];
+    pl_ml_context ml_context;
+    char *ml_model_path;
+    struct pl_ml_render_result ml_result;
+    struct pl_color_map_params ml_color_map;
     enum pl_color_levels output_levels;
 
     struct pl_icc_params icc_params;
@@ -177,7 +184,22 @@ struct gl_next_opts {
     int target_hint;
     int target_hint_mode;
     bool target_hint_strict;
+    char *ml_model;
+    int ml_gamma_mode;
+    float ml_gamma;
+    int ml_cr_mode;
+    float ml_cr_strength;
+    int ml_fire_pop_mode;
+    float ml_fire_pop_strength;
+    int ml_radiance_mode;
+    float ml_radiance_knee;
+    float ml_radiance_strength;
     char **raw_opts;
+};
+
+const struct m_opt_choice_alternatives ml_control_modes[] = {
+    {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO},
+    {"manual", PL_ML_CONTROL_MANUAL}, {0},
 };
 
 const struct m_opt_choice_alternatives lut_types[] = {
@@ -216,6 +238,16 @@ const struct m_sub_options gl_next_conf = {
         {"target-colorspace-hint", OPT_CHOICE(target_hint, {"auto", -1}, {"no", 0}, {"yes", 1})},
         {"target-colorspace-hint-mode", OPT_CHOICE(target_hint_mode, {"target", 0}, {"source", 1}, {"source-dynamic", 2})},
         {"target-colorspace-hint-strict", OPT_BOOL(target_hint_strict)},
+        {"ml-model", OPT_STRING(ml_model), .flags = M_OPT_FILE},
+        {"ml-gamma", OPT_CHOICE(ml_gamma_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
+        {"ml-gamma-value", OPT_FLOAT(ml_gamma), M_RANGE(0.5, 1.5)},
+        {"ml-cr", OPT_CHOICE(ml_cr_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
+        {"ml-cr-strength", OPT_FLOAT(ml_cr_strength), M_RANGE(0, 0.5)},
+        {"ml-fire-pop", OPT_CHOICE(ml_fire_pop_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
+        {"ml-fire-pop-strength", OPT_FLOAT(ml_fire_pop_strength), M_RANGE(0, 2)},
+        {"ml-radiance", OPT_CHOICE(ml_radiance_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
+        {"ml-radiance-knee", OPT_FLOAT(ml_radiance_knee), M_RANGE(0.4, 0.9)},
+        {"ml-radiance-strength", OPT_FLOAT(ml_radiance_strength), M_RANGE(0, 0.6)},
         // No `target-lut-type` because we don't support non-RGB targets
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
@@ -228,6 +260,11 @@ const struct m_sub_options gl_next_conf = {
         .image_subs_hdr_peak = PL_COLOR_SDR_WHITE,
         .target_hint = -1,
         .target_hint_strict = true,
+        .ml_gamma = 1.0,
+        .ml_cr_strength = 0.3,
+        .ml_fire_pop_strength = 1.0,
+        .ml_radiance_knee = 0.6,
+        .ml_radiance_strength = 0.3,
     },
     .size = sizeof(struct gl_next_opts),
     .change_flags = UPDATE_VIDEO,
@@ -299,6 +336,25 @@ static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
         pl_buf_destroy(gpu, &buf);
         return NULL;
     }
+        static void update_ml_context(struct priv *p)
+        {
+            const char *path = p->next_opts->ml_model;
+            if (!path || !path[0]) {
+                pl_ml_context_destroy(&p->ml_context);
+                TA_FREEP(&p->ml_model_path);
+                return;
+            }
+            if (p->ml_context && !strcmp(p->ml_model_path, path))
+                return;
+            pl_ml_context_destroy(&p->ml_context);
+            TA_FREEP(&p->ml_model_path);
+            p->ml_context = pl_ml_context_create(pl_ml_context_params(
+                .log = p->pllog, .model_path = path));
+            if (p->ml_context)
+                p->ml_model_path = talloc_strdup(p, path);
+            else
+                MP_ERR(p, "Failed loading ML model: %s\n", path);
+        }
 
     mp_mutex_lock(&p->dr_lock);
     MP_TARRAY_APPEND(p, p->dr_buffers, p->num_dr_buffers, buf);
@@ -1002,12 +1058,60 @@ static enum pl_color_primaries get_best_prim_container(const struct pl_raw_prima
 static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
                                      const struct mp_image *mpi);
 
+static void update_ml_render(struct priv *p, struct pl_frame_mix *mix,
+                             pl_options pars)
+{
+    struct gl_next_opts *opts = p->next_opts;
+    if (!opts->ml_model || !opts->ml_model[0])
+        return;
+    if (!p->ml_context)
+        return;
+
+    // Evaluate ML for the primary source frame
+    struct pl_frame *source = mix->num_frames > 0 ?
+        (struct pl_frame *) mix->frames[0] : NULL;
+    if (!source)
+        return;
+
+    struct pl_ml_render_params ml_params = {
+        .model = p->ml_context,
+        .gamma_mode = opts->ml_gamma_mode,
+        .gamma = opts->ml_gamma,
+        .cr_mode = opts->ml_cr_mode,
+        .cr_strength = opts->ml_cr_strength,
+        .fire_pop_mode = opts->ml_fire_pop_mode,
+        .fire_pop_strength = opts->ml_fire_pop_strength,
+        .radiance = (struct pl_ml_radiance_params) {
+            .mode = opts->ml_radiance_mode,
+            .knee = opts->ml_radiance_knee,
+            .strength = opts->ml_radiance_strength,
+        },
+        .target_nits = 1000.0f,
+    };
+
+    if (!pl_ml_render_evaluate(p->gpu, source, &ml_params, &p->ml_result)) {
+        MP_WARN(vo, "ML render evaluation failed\n");
+        return;
+    }
+
+    // Get ML hooks and add to render params
+    int num_ml_hooks = pl_ml_render_get_hooks(&p->ml_result, p->ml_hooks);
+    if (num_ml_hooks > 0) {
+        MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, &p->ml_hooks[0]);
+        MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, &p->ml_hooks[1]);
+        MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, &p->ml_hooks[2]);
+    }
+}
+
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
     update_options(vo);
+
+    // Update ML context if model path changed
+    update_ml_context(p);
 
     struct pl_render_params params = pars->params;
     const struct gl_video_opts *opts = p->opts_cache->opts;
@@ -1402,6 +1506,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         for (int i = 0; i < pars->params.num_hooks; i++)
             update_hook_opts_dynamic(p, p->hooks[i], frame->current);
     }
+
+    // Apply ML rendering hooks
+    update_ml_render(p, &mix, pars);
 
     // Render frame
     if (!pl_render_image_mix(p->rr, &mix, &target, &params)) {
@@ -2107,6 +2214,9 @@ static void uninit(struct vo *vo)
 
     pl_icc_close(&p->icc_profile);
     pl_renderer_destroy(&p->rr);
+
+    pl_ml_context_destroy(&p->ml_context);
+    TA_FREEP(&p->ml_model_path);
 
     for (int i = 0; i < VO_PASS_PERF_MAX; ++i) {
         pl_shader_info_deref(&p->perf_fresh.info[i].shader);
