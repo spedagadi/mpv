@@ -149,7 +149,9 @@ struct priv {
     struct scaler_params scalers[SCALER_COUNT];
     const struct pl_hook **hooks; // storage for `params.hooks`
     const struct pl_hook **active_hooks;
-    struct pl_hook ml_hooks[4]; // fire, L2, radiance, chroma
+    int base_num_hooks;           // hook count after GLSL shaders, before ML hooks
+    struct pl_hook ml_hooks[4];   // fire, L2, radiance, chroma
+    pl_ml_feature_cache ml_feature_cache; // persistent GPU resources for feature extraction
     pl_ml_context ml_context;
     char *ml_model_path;
     struct pl_ml_render_result ml_result;
@@ -1105,7 +1107,8 @@ static void update_ml_context(struct priv *p)
 }
 
 static void update_ml_render(struct vo *vo, struct priv *p,
-                             struct pl_frame_mix *mix, pl_options pars)
+                             struct pl_frame_mix *mix, pl_options pars,
+                             const struct pl_frame *target)
 {
     struct gl_next_opts *opts = p->next_opts;
     if (!opts->ml_model || !opts->ml_model[0])
@@ -1118,10 +1121,10 @@ static void update_ml_render(struct vo *vo, struct priv *p,
     if (!source)
         return;
 
-    // Get target display nits from the render target color space
-    float target_nits = pars->params.color_map_params
-        ? pars->params.color_map_params->tone_mapping_param
-        : 0.0f;
+    // Get target display nits from the render target frame's HDR metadata
+    float target_nits = 0.0f;
+    if (target && target->color.hdr.max_luma > 0.0f)
+        target_nits = target->color.hdr.max_luma;
     if (target_nits <= 0.0f)
         target_nits = 203.0f; // SDR reference white
 
@@ -1173,12 +1176,17 @@ static void update_ml_render(struct vo *vo, struct priv *p,
         .target_nits          = target_nits,
         .l1_max_pq            = l1max,
         .l1_avg_pq            = l1avg,
+        .feature_cache        = p->ml_feature_cache,
     };
 
+    int64_t t0 = mp_time_ns();
     if (!pl_ml_render_evaluate(p->gpu, source, &ml_params, &p->ml_result)) {
         MP_WARN(vo, "ML render evaluation failed\n");
         return;
     }
+    int64_t t1 = mp_time_ns();
+    MP_VERBOSE(vo, "ML timing: pl_ml_render_evaluate=%.2f ms\n",
+               (t1 - t0) / 1e6);
 
     // Update IIR accumulator with this frame's actual rendered values
     float A = MPCLAMP(opts->ml_iir_alpha, 0.0f, 1.0f);
@@ -1199,9 +1207,10 @@ static void update_ml_render(struct vo *vo, struct priv *p,
         if (l1avg > 0.0f)  p->ml_iir.l1_avg_pq = l1avg;
     }
 
-    // Log ML state (visible with mpv -v)
+    int64_t t2 = mp_time_ns();
+    // Log ML state + timing (visible with mpv -v)
     MP_VERBOSE(vo, "ML: gamma=%.3f(%s) cr=%.3f(%s) rad=%.3f@%.2f(%s) "
-               "chroma=%s fire=%.2f iir=%.2f l1max=%.4f\n",
+               "chroma=%s fire=%.2f iir=%.2f l1max=%.4f  [eval=%.1fms iir=%.1fms]\n",
                p->ml_result.gamma,
                p->ml_result.model_used ? "model" : "fallback",
                p->ml_result.cr_strength,
@@ -1212,12 +1221,16 @@ static void update_ml_render(struct vo *vo, struct priv *p,
                opts->ml_radiance_mode == PL_ML_CONTROL_AUTO ? "auto" : "manual",
                opts->ml_chroma_mode == PL_ML_CONTROL_OFF ? "off" :
                opts->ml_chroma_mode == PL_ML_CONTROL_AUTO ? "auto" : "manual",
-               opts->ml_fire_pop_strength, A, l1max);
+               opts->ml_fire_pop_strength, A, l1max,
+               (t1 - t0) / 1e6, (t2 - t1) / 1e6);
 
-    // Register hooks — iterate only the ones actually returned
+    // Reset hook count to base (GLSL only) before appending ML hooks each frame.
+    // Without this, num_hooks grows by K every frame causing buffer overflow.
+    pars->params.num_hooks = p->base_num_hooks;
     int num_ml_hooks = pl_ml_render_get_hooks(&p->ml_result, p->ml_hooks);
     for (int i = 0; i < num_ml_hooks; i++)
         MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, &p->ml_hooks[i]);
+    pars->params.hooks = p->hooks; // refresh after potential realloc
 }
 
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
@@ -1226,9 +1239,6 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
     update_options(vo);
-
-    // Update ML context if model path changed
-    update_ml_context(p);
 
     struct pl_render_params params = pars->params;
     const struct gl_video_opts *opts = p->opts_cache->opts;
@@ -1628,7 +1638,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
 
     // Apply ML rendering hooks
-    update_ml_render(vo, p, &mix, pars);
+    update_ml_render(vo, p, &mix, pars, &target);
 
     // Render frame
     if (!pl_render_image_mix(p->rr, &mix, &target, &params)) {
@@ -2346,6 +2356,7 @@ static void uninit(struct vo *vo)
     pl_renderer_destroy(&p->rr);
 
     pl_ml_context_destroy(&p->ml_context);
+    pl_ml_feature_cache_destroy(&p->ml_feature_cache);
     TA_FREEP(&p->ml_model_path);
 
     for (int i = 0; i < VO_PASS_PERF_MAX; ++i) {
@@ -2414,6 +2425,9 @@ static int preinit(struct vo *vo)
 
     p->pars = pl_options_alloc(p->pllog);
     update_render_options(vo);
+    update_ml_context(p);  // pre-load XGBoost model before first frame
+    // Create persistent feature extraction cache (reuses luma tex + renderer each frame)
+    p->ml_feature_cache = pl_ml_feature_cache_create(p->gpu, 256, 144);
     return 0;
 
 err_out:
@@ -2865,6 +2879,7 @@ AV_NOWARN_DEPRECATED(
     }
 
     pars->params.hooks = p->hooks;
+    p->base_num_hooks = pars->params.num_hooks; // checkpoint before ML hooks
 
     MP_DBG(p, "Render options updated, resetting render state.\n");
     p->want_reset = true;
