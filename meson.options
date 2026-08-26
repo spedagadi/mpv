@@ -6,6 +6,7 @@ option('build-date', type: 'boolean', value: true, description: 'include compile
 option('tests', type: 'boolean', value: false, description: 'meson unit tests')
 option('fuzzers', type: 'boolean', value: false, description: 'fuzzer binaries')
 option('disable-packet-pool', type: 'boolean', value: false, description: 'disable packet pool (development only)')
+option('libplacebo-build-dir', type: 'string', value: '', description: 'path to a local libplacebo Meson build directory')
 
 # misc features
 option('cdda', type: 'feature', value: 'auto', description: 'cdda support (libcdio)')

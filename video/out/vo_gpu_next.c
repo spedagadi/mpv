@@ -92,6 +92,10 @@ struct user_lut {
 struct frame_info {
     int count;
     struct pl_dispatch_info info[VO_PASS_PERF_MAX];
+    bool ml_active;
+    bool ml_model_fallback;
+    float ml_gamma;
+    float ml_cr_strength;
 };
 
 struct cache {
@@ -145,12 +149,23 @@ struct priv {
     struct scaler_params scalers[SCALER_COUNT];
     const struct pl_hook **hooks; // storage for `params.hooks`
     const struct pl_hook **active_hooks;
-    struct pl_hook ml_hooks[3];
+    struct pl_hook ml_hooks[4]; // fire, L2, radiance, chroma
     pl_ml_context ml_context;
     char *ml_model_path;
     struct pl_ml_render_result ml_result;
     struct pl_color_map_params ml_color_map;
     enum pl_color_levels output_levels;
+
+    // Temporal IIR smoothing state for ML parameters
+    struct {
+        bool initialized;
+        float l1_max_pq;
+        float l1_avg_pq;
+        float gamma;
+        float cr_strength;
+        float radiance_strength;
+        float radiance_knee;
+    } ml_iir;
 
     struct pl_icc_params icc_params;
     char *icc_path;
@@ -194,6 +209,13 @@ struct gl_next_opts {
     int ml_radiance_mode;
     float ml_radiance_knee;
     float ml_radiance_strength;
+    int ml_chroma_mode;
+    float ml_chroma_neutral_boost;
+    float ml_chroma_fire_boost;
+    float ml_chroma_knee;
+    float ml_chroma_skin_protect;
+    float ml_iir_alpha;
+    float ml_scene_cut;
     char **raw_opts;
 };
 
@@ -248,6 +270,13 @@ const struct m_sub_options gl_next_conf = {
         {"ml-radiance", OPT_CHOICE(ml_radiance_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
         {"ml-radiance-knee", OPT_FLOAT(ml_radiance_knee), M_RANGE(0.4, 0.9)},
         {"ml-radiance-strength", OPT_FLOAT(ml_radiance_strength), M_RANGE(0, 0.6)},
+        {"ml-chroma", OPT_CHOICE(ml_chroma_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
+        {"ml-chroma-neutral", OPT_FLOAT(ml_chroma_neutral_boost), M_RANGE(1.0, 1.5)},
+        {"ml-chroma-fire", OPT_FLOAT(ml_chroma_fire_boost), M_RANGE(1.0, 1.5)},
+        {"ml-chroma-knee", OPT_FLOAT(ml_chroma_knee), M_RANGE(0.1, 0.9)},
+        {"ml-chroma-skin", OPT_FLOAT(ml_chroma_skin_protect), M_RANGE(0.5, 1.0)},
+        {"ml-iir-alpha", OPT_FLOAT(ml_iir_alpha), M_RANGE(0.0, 1.0)},
+        {"ml-scene-cut", OPT_FLOAT(ml_scene_cut), M_RANGE(0.0, 0.5)},
         // No `target-lut-type` because we don't support non-RGB targets
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
@@ -265,6 +294,12 @@ const struct m_sub_options gl_next_conf = {
         .ml_fire_pop_strength = 1.0,
         .ml_radiance_knee = 0.6,
         .ml_radiance_strength = 0.3,
+        .ml_chroma_neutral_boost = 1.20f,
+        .ml_chroma_fire_boost = 1.35f,
+        .ml_chroma_knee = 0.55f,
+        .ml_chroma_skin_protect = 0.95f,
+        .ml_iir_alpha = 0.10f,
+        .ml_scene_cut = 0.15f,
     },
     .size = sizeof(struct gl_next_opts),
     .change_flags = UPDATE_VIDEO,
@@ -336,25 +371,6 @@ static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
         pl_buf_destroy(gpu, &buf);
         return NULL;
     }
-        static void update_ml_context(struct priv *p)
-        {
-            const char *path = p->next_opts->ml_model;
-            if (!path || !path[0]) {
-                pl_ml_context_destroy(&p->ml_context);
-                TA_FREEP(&p->ml_model_path);
-                return;
-            }
-            if (p->ml_context && !strcmp(p->ml_model_path, path))
-                return;
-            pl_ml_context_destroy(&p->ml_context);
-            TA_FREEP(&p->ml_model_path);
-            p->ml_context = pl_ml_context_create(pl_ml_context_params(
-                .log = p->pllog, .model_path = path));
-            if (p->ml_context)
-                p->ml_model_path = talloc_strdup(p, path);
-            else
-                MP_ERR(p, "Failed loading ML model: %s\n", path);
-        }
 
     mp_mutex_lock(&p->dr_lock);
     MP_TARRAY_APPEND(p, p->dr_buffers, p->num_dr_buffers, buf);
@@ -861,6 +877,16 @@ static void info_callback(void *priv, const struct pl_render_info *info)
 
     frame->count = info->index + 1;
     pl_dispatch_info_move(&frame->info[info->index], info->pass);
+
+    // Track ML status from recent frames
+    if (p->ml_result.model_used) {
+        frame->ml_active = true;
+        frame->ml_gamma = p->ml_result.gamma;
+        frame->ml_cr_strength = p->ml_result.cr_strength;
+    }
+    if (p->ml_result.model_fallback) {
+        frame->ml_model_fallback = true;
+    }
 }
 
 static void update_options(struct vo *vo)
@@ -1058,8 +1084,28 @@ static enum pl_color_primaries get_best_prim_container(const struct pl_raw_prima
 static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
                                      const struct mp_image *mpi);
 
-static void update_ml_render(struct priv *p, struct pl_frame_mix *mix,
-                             pl_options pars)
+static void update_ml_context(struct priv *p)
+{
+    const char *path = p->next_opts->ml_model;
+    if (!path || !path[0]) {
+        pl_ml_context_destroy(&p->ml_context);
+        TA_FREEP(&p->ml_model_path);
+        return;
+    }
+    if (p->ml_context && !strcmp(p->ml_model_path, path))
+        return;
+    pl_ml_context_destroy(&p->ml_context);
+    TA_FREEP(&p->ml_model_path);
+    p->ml_context = pl_ml_context_create(pl_ml_context_params(
+        .log = p->pllog, .model_path = path));
+    if (p->ml_context)
+        p->ml_model_path = talloc_strdup(p, path);
+    else
+        MP_ERR(p, "Failed loading ML model: %s\n", path);
+}
+
+static void update_ml_render(struct vo *vo, struct priv *p,
+                             struct pl_frame_mix *mix, pl_options pars)
 {
     struct gl_next_opts *opts = p->next_opts;
     if (!opts->ml_model || !opts->ml_model[0])
@@ -1067,26 +1113,66 @@ static void update_ml_render(struct priv *p, struct pl_frame_mix *mix,
     if (!p->ml_context)
         return;
 
-    // Evaluate ML for the primary source frame
     struct pl_frame *source = mix->num_frames > 0 ?
         (struct pl_frame *) mix->frames[0] : NULL;
     if (!source)
         return;
 
+    // Get target display nits from the render target color space
+    float target_nits = pars->params.color_map_params
+        ? pars->params.color_map_params->tone_mapping_param
+        : 0.0f;
+    if (target_nits <= 0.0f)
+        target_nits = 203.0f; // SDR reference white
+
+    // IIR: scene cut detection using HDR metadata
+    float l1max = source->color.hdr.max_pq_y;
+    float l1avg = source->color.hdr.avg_pq_y;
+    bool scene_cut = false;
+    if (p->ml_iir.initialized && opts->ml_iir_alpha < 1.0f) {
+        float l1max_prev = p->ml_iir.l1_max_pq > 0.0f ? p->ml_iir.l1_max_pq : l1max;
+        float l1avg_prev = p->ml_iir.l1_avg_pq > 0.0f ? p->ml_iir.l1_avg_pq : l1avg;
+        if (l1max > 0.01f && fabsf(l1max - l1max_prev) > opts->ml_scene_cut)
+            scene_cut = true;
+        if (l1avg > 0.0f && fabsf(l1avg - l1avg_prev) > opts->ml_scene_cut * 0.67f)
+            scene_cut = true;
+        if (scene_cut)
+            MP_VERBOSE(vo, "ML IIR: scene cut detected (l1max %.3f→%.3f), resetting\n",
+                       l1max_prev, l1max);
+    }
+    if (scene_cut || !p->ml_iir.initialized)
+        p->ml_iir.initialized = false; // will reinit after this frame
+
+    // Build ML params — apply IIR smoothed values for AUTO modes
     struct pl_ml_render_params ml_params = {
-        .model = p->ml_context,
-        .gamma_mode = opts->ml_gamma_mode,
-        .gamma = opts->ml_gamma,
-        .cr_mode = opts->ml_cr_mode,
-        .cr_strength = opts->ml_cr_strength,
-        .fire_pop_mode = opts->ml_fire_pop_mode,
-        .fire_pop_strength = opts->ml_fire_pop_strength,
-        .radiance = (struct pl_ml_radiance_params) {
-            .mode = opts->ml_radiance_mode,
-            .knee = opts->ml_radiance_knee,
-            .strength = opts->ml_radiance_strength,
+        .model              = p->ml_context,
+        .gamma_mode         = opts->ml_gamma_mode,
+        .gamma              = (opts->ml_gamma_mode == PL_ML_CONTROL_MANUAL &&
+                               p->ml_iir.initialized && opts->ml_iir_alpha < 1.0f)
+                              ? p->ml_iir.gamma : opts->ml_gamma,
+        .cr_mode            = opts->ml_cr_mode,
+        .cr_strength        = (opts->ml_cr_mode == PL_ML_CONTROL_MANUAL &&
+                               p->ml_iir.initialized && opts->ml_iir_alpha < 1.0f)
+                              ? p->ml_iir.cr_strength : opts->ml_cr_strength,
+        .fire_pop_mode      = opts->ml_fire_pop_mode,
+        .fire_pop_strength  = opts->ml_fire_pop_strength,
+        .radiance           = (struct pl_ml_radiance_params) {
+            .mode     = opts->ml_radiance_mode,
+            .knee     = (opts->ml_radiance_mode == PL_ML_CONTROL_MANUAL &&
+                         p->ml_iir.initialized && opts->ml_iir_alpha < 1.0f)
+                        ? p->ml_iir.radiance_knee : opts->ml_radiance_knee,
+            .strength = (opts->ml_radiance_mode == PL_ML_CONTROL_MANUAL &&
+                         p->ml_iir.initialized && opts->ml_iir_alpha < 1.0f)
+                        ? p->ml_iir.radiance_strength : opts->ml_radiance_strength,
         },
-        .target_nits = 1000.0f,
+        .chroma_mode          = opts->ml_chroma_mode,
+        .chroma_neutral_boost = opts->ml_chroma_neutral_boost,
+        .chroma_fire_boost    = opts->ml_chroma_fire_boost,
+        .chroma_knee          = opts->ml_chroma_knee,
+        .chroma_skin_protect  = opts->ml_chroma_skin_protect,
+        .target_nits          = target_nits,
+        .l1_max_pq            = l1max,
+        .l1_avg_pq            = l1avg,
     };
 
     if (!pl_ml_render_evaluate(p->gpu, source, &ml_params, &p->ml_result)) {
@@ -1094,13 +1180,44 @@ static void update_ml_render(struct priv *p, struct pl_frame_mix *mix,
         return;
     }
 
-    // Get ML hooks and add to render params
-    int num_ml_hooks = pl_ml_render_get_hooks(&p->ml_result, p->ml_hooks);
-    if (num_ml_hooks > 0) {
-        MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, &p->ml_hooks[0]);
-        MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, &p->ml_hooks[1]);
-        MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, &p->ml_hooks[2]);
+    // Update IIR accumulator with this frame's actual rendered values
+    float A = MPCLAMP(opts->ml_iir_alpha, 0.0f, 1.0f);
+    if (!p->ml_iir.initialized || A >= 1.0f) {
+        p->ml_iir.gamma             = p->ml_result.gamma;
+        p->ml_iir.cr_strength       = p->ml_result.cr_strength;
+        p->ml_iir.radiance_strength = p->ml_result.radiance.strength;
+        p->ml_iir.radiance_knee     = p->ml_result.radiance.knee;
+        p->ml_iir.l1_max_pq         = l1max > 0.01f ? l1max : p->ml_iir.l1_max_pq;
+        p->ml_iir.l1_avg_pq         = l1avg > 0.0f  ? l1avg : p->ml_iir.l1_avg_pq;
+        p->ml_iir.initialized       = true;
+    } else {
+        p->ml_iir.gamma             = A * p->ml_result.gamma             + (1.0f-A) * p->ml_iir.gamma;
+        p->ml_iir.cr_strength       = A * p->ml_result.cr_strength       + (1.0f-A) * p->ml_iir.cr_strength;
+        p->ml_iir.radiance_strength = A * p->ml_result.radiance.strength + (1.0f-A) * p->ml_iir.radiance_strength;
+        p->ml_iir.radiance_knee     = A * p->ml_result.radiance.knee     + (1.0f-A) * p->ml_iir.radiance_knee;
+        if (l1max > 0.01f) p->ml_iir.l1_max_pq = l1max;
+        if (l1avg > 0.0f)  p->ml_iir.l1_avg_pq = l1avg;
     }
+
+    // Log ML state (visible with mpv -v)
+    MP_VERBOSE(vo, "ML: gamma=%.3f(%s) cr=%.3f(%s) rad=%.3f@%.2f(%s) "
+               "chroma=%s fire=%.2f iir=%.2f l1max=%.4f\n",
+               p->ml_result.gamma,
+               p->ml_result.model_used ? "model" : "fallback",
+               p->ml_result.cr_strength,
+               opts->ml_cr_mode == PL_ML_CONTROL_OFF ? "off" :
+               opts->ml_cr_mode == PL_ML_CONTROL_AUTO ? "auto" : "manual",
+               p->ml_result.radiance.strength, p->ml_result.radiance.knee,
+               opts->ml_radiance_mode == PL_ML_CONTROL_OFF ? "off" :
+               opts->ml_radiance_mode == PL_ML_CONTROL_AUTO ? "auto" : "manual",
+               opts->ml_chroma_mode == PL_ML_CONTROL_OFF ? "off" :
+               opts->ml_chroma_mode == PL_ML_CONTROL_AUTO ? "auto" : "manual",
+               opts->ml_fire_pop_strength, A, l1max);
+
+    // Register hooks — iterate only the ones actually returned
+    int num_ml_hooks = pl_ml_render_get_hooks(&p->ml_result, p->ml_hooks);
+    for (int i = 0; i < num_ml_hooks; i++)
+        MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, &p->ml_hooks[i]);
 }
 
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
@@ -1166,6 +1283,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             p->last_pts = 0.0;
             p->last_id = 0;
             p->want_reset = false;
+            // Reset IIR on seek so previous scene's values don't bleed in
+            p->ml_iir.initialized = false;
+            MP_VERBOSE(vo, "ML IIR: reset on seek\n");
         }
 
         if (id <= p->last_id)
@@ -1508,7 +1628,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
 
     // Apply ML rendering hooks
-    update_ml_render(p, &mix, pars);
+    update_ml_render(vo, p, &mix, pars);
 
     // Render frame
     if (!pl_render_image_mix(p->rr, &mix, &target, &params)) {
@@ -1885,6 +2005,16 @@ static inline void copy_frame_info_to_mp(struct frame_info *pl,
 
         strncpy(mp->desc[i], pass->shader->description, sizeof(mp->desc[i]) - 1);
         mp->desc[i][sizeof(mp->desc[i]) - 1] = '\0';
+    }
+
+    // Add ML model status as a custom pass entry
+    if (pl->ml_active && mp->count < VO_PASS_PERF_MAX) {
+        int idx = mp->count++;
+        struct mp_pass_perf *ml_perf = &mp->perf[idx];
+        ml_perf->count = 0;
+        ml_perf->last = ml_perf->peak = ml_perf->avg = 0;
+        snprintf(mp->desc[idx], sizeof(mp->desc[idx]),
+                 "ML[%.2f gamma %.2f CR]", pl->ml_gamma, pl->ml_cr_strength);
     }
 }
 

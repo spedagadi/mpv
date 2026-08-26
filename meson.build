@@ -26,8 +26,17 @@ libavutil = dependency('libavutil', version: '>= 58.29.100')
 libswresample = dependency('libswresample', version: '>= 4.12.100')
 libswscale = dependency('libswscale', version: '>= 7.5.100')
 
-libplacebo = dependency('libplacebo', version: '>=6.338.2',
-                default_options: ['default_library=static', 'demos=false'])
+libplacebo_build_dir = get_option('libplacebo-build-dir')
+if libplacebo_build_dir == ''
+    libplacebo = dependency('libplacebo', version: '>=6.338.2',
+                    default_options: ['default_library=static', 'demos=false'])
+else
+    libplacebo = declare_dependency(
+        compile_args: ['-I' + join_paths(libplacebo_build_dir, 'src/include')],
+        link_args: [join_paths(libplacebo_build_dir, 'src/libplacebo.dll.a')],
+        variables: {'pl_has_vulkan': '1'},
+    )
+endif
 
 libass = dependency('libass', version: '>= 0.12.2')
 
