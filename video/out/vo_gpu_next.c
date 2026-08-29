@@ -161,6 +161,7 @@ struct priv {
     const struct pl_hook **active_hooks;
     int base_num_hooks;           // hook count after GLSL shaders, before ML hooks
     struct pl_hook ml_hooks[7];   // SDR→P5 emulation (if active), shadow, fire, L2, radiance, chroma, highlight
+    int render_frame_cnt;        // frames rendered (VP acq warm-up hold)
     pl_ml_context ml_context;
     char *ml_model_path;
     pl_ml_context shadow_context;
@@ -248,6 +249,8 @@ struct gl_next_opts {
     bool ml_sdr_emulate;       // SDR→P5 virtual-master bridge (PL_HOOK_RGB_INPUT)
     float ml_sdr_virtual_nits; // virtual P5 ceiling for the emulation (nits)
     float ml_sdr_strength;   // shaped mid-lift strength (0..1) for the bridge
+    bool ml_acq_warm_hold;     // VP acq: present black until ML/shaders warm
+    int  ml_acq_warm_frames;   // min frames rendered before the hold releases
     char **raw_opts;
 };
 
@@ -321,6 +324,8 @@ const struct m_sub_options gl_next_conf = {
         {"ml-emulate-sdr",     OPT_BOOL(ml_sdr_emulate)},
         {"ml-sdr-virtual-nits", OPT_FLOAT(ml_sdr_virtual_nits), M_RANGE(100.0, 4000.0)},
         {"ml-sdr-strength",     OPT_FLOAT(ml_sdr_strength),     M_RANGE(0.0, 1.0)},
+        {"ml-acq-warm-hold",     OPT_BOOL(ml_acq_warm_hold)},
+        {"ml-acq-warm-frames",   OPT_INT(ml_acq_warm_frames), M_RANGE(1, 240)},
         // No `target-lut-type` because we don't support non-RGB targets
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
@@ -341,6 +346,7 @@ const struct m_sub_options gl_next_conf = {
         .ml_radiance_shoulder = 0.82f,
         .ml_sdr_virtual_nits  = 1000.0f,
         .ml_sdr_strength     = 0.5f,
+        .ml_acq_warm_frames  = 5,
         .ml_chroma_neutral_boost = 1.20f,
         .ml_chroma_fire_boost = 1.35f,
         .ml_chroma_knee = 0.55f,
@@ -1913,6 +1919,18 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     p->is_interpolated = pts_offset != 0 && mix.num_frames > 1;
     valid = true;
+
+    // VP acquisition warm-up hold: keep rendering (compiles hook shaders,
+    // warms ML/peak state) but present BLACK for the first `warm_frames`
+    // rendered frames — the viewer never sees a half-warmed picture, and
+    // release is guaranteed by the frame count alone (the early-cutover
+    // decision). NOTE: gating on ML IIR initialization is unreliable in
+    // capture (can stall the Oracle), which black-screened the rig — frame
+    // count only.
+    p->render_frame_cnt++;
+    if (p->next_opts->ml_acq_warm_hold &&
+        p->render_frame_cnt < p->next_opts->ml_acq_warm_frames)
+        pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
     // fall through
 
 done:
@@ -1921,6 +1939,20 @@ done:
 
     pl_gpu_flush(gpu);
     p->frame_pending = true;
+
+    // VP latency diagnostic: with video_pts=wallclock each frame carries its
+    // capture wall-clock PTS, so `now - pts` is the true presented age of the
+    // frame just swapped. Throttled ~1/s; only when the capture warm-up hold
+    // is armed. Drop counters never expose this number.
+    if (frame->current && p->next_opts->ml_acq_warm_hold) {
+        static int dbg;
+        if ((dbg++ % 60) == 0) {
+            double now = mp_time_now();
+            int age_ms = (int)((now - frame->current->pts) * 1000);
+            MP_INFO(vo, "VP frame age: %d ms\n", age_ms);
+        }
+    }
+
     return VO_TRUE;
 }
 
