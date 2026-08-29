@@ -160,7 +160,7 @@ struct priv {
     const struct pl_hook **hooks; // storage for `params.hooks`
     const struct pl_hook **active_hooks;
     int base_num_hooks;           // hook count after GLSL shaders, before ML hooks
-    struct pl_hook ml_hooks[6];   // shadow, fire, L2, radiance, chroma, highlight
+    struct pl_hook ml_hooks[7];   // SDR→P5 emulation (if active), shadow, fire, L2, radiance, chroma, highlight
     pl_ml_context ml_context;
     char *ml_model_path;
     pl_ml_context shadow_context;
@@ -245,6 +245,9 @@ struct gl_next_opts {
     float ml_scene_cut;
     float ml_gamma_max_delta;  // hard cap on gamma change per frame (0=disabled)
     float ml_iir_slow_alpha;   // slow EMA alpha for scene-cut baseline
+    bool ml_sdr_emulate;       // SDR→P5 virtual-master bridge (PL_HOOK_RGB_INPUT)
+    float ml_sdr_virtual_nits; // virtual P5 ceiling for the emulation (nits)
+    float ml_sdr_strength;   // shaped mid-lift strength (0..1) for the bridge
     char **raw_opts;
 };
 
@@ -315,6 +318,9 @@ const struct m_sub_options gl_next_conf = {
         {"ml-scene-cut",       OPT_FLOAT(ml_scene_cut),       M_RANGE(0.0, 0.5)},
         {"ml-gamma-max-delta", OPT_FLOAT(ml_gamma_max_delta), M_RANGE(0.0, 0.20)},
         {"ml-iir-slow-alpha",  OPT_FLOAT(ml_iir_slow_alpha),  M_RANGE(0.01, 0.30)},
+        {"ml-emulate-sdr",     OPT_BOOL(ml_sdr_emulate)},
+        {"ml-sdr-virtual-nits", OPT_FLOAT(ml_sdr_virtual_nits), M_RANGE(100.0, 4000.0)},
+        {"ml-sdr-strength",     OPT_FLOAT(ml_sdr_strength),     M_RANGE(0.0, 1.0)},
         // No `target-lut-type` because we don't support non-RGB targets
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
@@ -333,6 +339,8 @@ const struct m_sub_options gl_next_conf = {
         .ml_radiance_knee     = 0.6f,
         .ml_radiance_strength = 0.3f,
         .ml_radiance_shoulder = 0.82f,
+        .ml_sdr_virtual_nits  = 1000.0f,
+        .ml_sdr_strength     = 0.5f,
         .ml_chroma_neutral_boost = 1.20f,
         .ml_chroma_fire_boost = 1.35f,
         .ml_chroma_knee = 0.55f,
@@ -1335,6 +1343,9 @@ static void update_ml_render(struct vo *vo, struct priv *p,
         .l1_max_pq            = l1max,
         .l1_avg_pq            = l1avg,
         .is_sdr               = !pl_color_space_is_hdr(&source->color),
+        .emulate_sdr          = opts->ml_sdr_emulate,
+        .sdr_virtual_nits     = opts->ml_sdr_virtual_nits,
+        .sdr_strength         = opts->ml_sdr_strength,
         .renderer             = p->rr,
     };
 
@@ -1427,6 +1438,29 @@ static void update_ml_render(struct vo *vo, struct priv *p,
                p->ml_result.shadow_strength, p->ml_result.shadow_knee,
                p->ml_result.highlight_strength, p->ml_result.highlight_knee,
                (t1 - t0) / 1e6, (t2 - t1) / 1e6);
+
+    // SDR→P5 emulation observability — log when the bridge (or its calibration
+    // knobs) changes, so live slider movement is visible in the log.
+    static bool last_sdr_emu = false;
+    static int  last_vn  = 0;
+    static int  last_str = -1;
+    static int  log_cool = 0;
+    int cur_vn  = (int) p->ml_result.sdr_virtual_nits;
+    int cur_str = (int) (p->ml_result.sdr_strength * 100.0f);
+    if (log_cool <= 0 &&
+        (p->ml_result.sdr_emulate != last_sdr_emu ||
+         (last_sdr_emu && (cur_vn != last_vn || cur_str != last_str))))
+    {
+        log_cool = 30;   // adaptive strength varies per frame — cap log rate
+        last_sdr_emu = p->ml_result.sdr_emulate;
+        last_vn  = cur_vn;
+        last_str = cur_str;
+        MP_INFO(vo, "[Zion] SDR→P5 emulation %s (virtual %d nits, str %.2f)\n",
+                last_sdr_emu ? "ACTIVE" : "off",
+                cur_vn, p->ml_result.sdr_strength);
+    }
+    if (log_cool > 0)
+        log_cool--;
 
     // Hook application happens in apply_ml_hooks() (called before render).
     // update_ml_render() is called AFTER render — hooks for next frame will
