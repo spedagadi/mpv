@@ -29,6 +29,16 @@
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/utils/frame_queue.h>
 
+#ifdef __has_include
+#  if __has_include("unplugged_build.h")
+#    include "unplugged_build.h"
+#  endif
+#endif
+#ifndef UNPLUGGED_BUILD_NUM
+#  define UNPLUGGED_BUILD_NUM 0
+#  define UNPLUGGED_BUILD_DATE "dev"
+#endif
+
 #include "config.h"
 #include "common/common.h"
 #include "misc/io_utils.h"
@@ -150,10 +160,13 @@ struct priv {
     const struct pl_hook **hooks; // storage for `params.hooks`
     const struct pl_hook **active_hooks;
     int base_num_hooks;           // hook count after GLSL shaders, before ML hooks
-    struct pl_hook ml_hooks[4];   // fire, L2, radiance, chroma
-    pl_ml_feature_cache ml_feature_cache; // persistent GPU resources for feature extraction
+    struct pl_hook ml_hooks[6];   // shadow, fire, L2, radiance, chroma, highlight
     pl_ml_context ml_context;
     char *ml_model_path;
+    pl_ml_context shadow_context;
+    char *shadow_model_path;
+    pl_ml_context highlight_context;
+    char *highlight_model_path;
     struct pl_ml_render_result ml_result;
     struct pl_color_map_params ml_color_map;
     enum pl_color_levels output_levels;
@@ -161,9 +174,14 @@ struct priv {
     // Temporal IIR smoothing state for ML parameters
     struct {
         bool initialized;
-        float l1_max_pq;
-        float l1_avg_pq;
-        float gamma;
+        float l1_max_pq;       // raw last-frame l1max (for reference)
+        float l1_avg_pq;       // raw last-frame l1avg
+        float l1_max_slow;     // slow EMA of l1max (alpha=0.05, ~20-frame window)
+                               // used as scene-cut baseline — tracks gradual outdoor
+                               // content variation, ignores it, but genuine hard cuts
+                               // jump too fast for it to follow
+        float gamma;           // IIR-smoothed Oracle gamma
+        float gamma_prev;      // gamma applied last frame — used for delta clamp
         float cr_strength;
         float radiance_strength;
         float radiance_knee;
@@ -202,6 +220,12 @@ struct gl_next_opts {
     int target_hint_mode;
     bool target_hint_strict;
     char *ml_model;
+    char *ml_shadow_model;
+    char *ml_highlight_model;
+    int ml_shadow_mode;
+    int ml_highlight_mode;
+    float ml_shadow_strength;
+    float ml_highlight_strength;
     int ml_gamma_mode;
     float ml_gamma;
     int ml_cr_mode;
@@ -211,6 +235,7 @@ struct gl_next_opts {
     int ml_radiance_mode;
     float ml_radiance_knee;
     float ml_radiance_strength;
+    float ml_radiance_shoulder;
     int ml_chroma_mode;
     float ml_chroma_neutral_boost;
     float ml_chroma_fire_boost;
@@ -218,6 +243,8 @@ struct gl_next_opts {
     float ml_chroma_skin_protect;
     float ml_iir_alpha;
     float ml_scene_cut;
+    float ml_gamma_max_delta;  // hard cap on gamma change per frame (0=disabled)
+    float ml_iir_slow_alpha;   // slow EMA alpha for scene-cut baseline
     char **raw_opts;
 };
 
@@ -262,7 +289,13 @@ const struct m_sub_options gl_next_conf = {
         {"target-colorspace-hint", OPT_CHOICE(target_hint, {"auto", -1}, {"no", 0}, {"yes", 1})},
         {"target-colorspace-hint-mode", OPT_CHOICE(target_hint_mode, {"target", 0}, {"source", 1}, {"source-dynamic", 2})},
         {"target-colorspace-hint-strict", OPT_BOOL(target_hint_strict)},
-        {"ml-model", OPT_STRING(ml_model), .flags = M_OPT_FILE},
+        {"ml-model",           OPT_STRING(ml_model),           .flags = M_OPT_FILE},
+        {"ml-shadow-model",    OPT_STRING(ml_shadow_model),    .flags = M_OPT_FILE},
+        {"ml-highlight-model", OPT_STRING(ml_highlight_model), .flags = M_OPT_FILE},
+        {"ml-shadow",    OPT_CHOICE(ml_shadow_mode,    {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
+        {"ml-shadow-strength",    OPT_FLOAT(ml_shadow_strength),    M_RANGE(0.0, 0.5)},
+        {"ml-highlight",    OPT_CHOICE(ml_highlight_mode,    {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
+        {"ml-highlight-strength", OPT_FLOAT(ml_highlight_strength), M_RANGE(0.0, 0.4)},
         {"ml-gamma", OPT_CHOICE(ml_gamma_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
         {"ml-gamma-value", OPT_FLOAT(ml_gamma), M_RANGE(0.5, 1.5)},
         {"ml-cr", OPT_CHOICE(ml_cr_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
@@ -270,15 +303,18 @@ const struct m_sub_options gl_next_conf = {
         {"ml-fire-pop", OPT_CHOICE(ml_fire_pop_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
         {"ml-fire-pop-strength", OPT_FLOAT(ml_fire_pop_strength), M_RANGE(0, 2)},
         {"ml-radiance", OPT_CHOICE(ml_radiance_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
-        {"ml-radiance-knee", OPT_FLOAT(ml_radiance_knee), M_RANGE(0.4, 0.9)},
+        {"ml-radiance-knee",     OPT_FLOAT(ml_radiance_knee),     M_RANGE(0.4, 0.9)},
         {"ml-radiance-strength", OPT_FLOAT(ml_radiance_strength), M_RANGE(0, 0.6)},
+        {"ml-radiance-shoulder", OPT_FLOAT(ml_radiance_shoulder), M_RANGE(0.5, 0.99)},
         {"ml-chroma", OPT_CHOICE(ml_chroma_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
         {"ml-chroma-neutral", OPT_FLOAT(ml_chroma_neutral_boost), M_RANGE(1.0, 1.5)},
         {"ml-chroma-fire", OPT_FLOAT(ml_chroma_fire_boost), M_RANGE(1.0, 1.5)},
         {"ml-chroma-knee", OPT_FLOAT(ml_chroma_knee), M_RANGE(0.1, 0.9)},
         {"ml-chroma-skin", OPT_FLOAT(ml_chroma_skin_protect), M_RANGE(0.5, 1.0)},
-        {"ml-iir-alpha", OPT_FLOAT(ml_iir_alpha), M_RANGE(0.0, 1.0)},
-        {"ml-scene-cut", OPT_FLOAT(ml_scene_cut), M_RANGE(0.0, 0.5)},
+        {"ml-iir-alpha",       OPT_FLOAT(ml_iir_alpha),       M_RANGE(0.0, 1.0)},
+        {"ml-scene-cut",       OPT_FLOAT(ml_scene_cut),       M_RANGE(0.0, 0.5)},
+        {"ml-gamma-max-delta", OPT_FLOAT(ml_gamma_max_delta), M_RANGE(0.0, 0.20)},
+        {"ml-iir-slow-alpha",  OPT_FLOAT(ml_iir_slow_alpha),  M_RANGE(0.01, 0.30)},
         // No `target-lut-type` because we don't support non-RGB targets
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
@@ -294,14 +330,19 @@ const struct m_sub_options gl_next_conf = {
         .ml_gamma = 1.0,
         .ml_cr_strength = 0.3,
         .ml_fire_pop_strength = 1.0,
-        .ml_radiance_knee = 0.6,
-        .ml_radiance_strength = 0.3,
+        .ml_radiance_knee     = 0.6f,
+        .ml_radiance_strength = 0.3f,
+        .ml_radiance_shoulder = 0.82f,
         .ml_chroma_neutral_boost = 1.20f,
         .ml_chroma_fire_boost = 1.35f,
         .ml_chroma_knee = 0.55f,
         .ml_chroma_skin_protect = 0.95f,
-        .ml_iir_alpha = 0.10f,
-        .ml_scene_cut = 0.15f,
+        .ml_shadow_strength    = 0.20f,
+        .ml_highlight_strength = 0.15f,
+        .ml_iir_alpha        = 0.10f,
+        .ml_scene_cut        = 0.15f,
+        .ml_gamma_max_delta  = 0.02f,  // deadband: predictions within 2% ignored
+        .ml_iir_slow_alpha   = 0.05f,  // slow EMA for scene-cut baseline (~20 frames)
     },
     .size = sizeof(struct gl_next_opts),
     .change_flags = UPDATE_VIDEO,
@@ -1092,20 +1133,71 @@ static void update_ml_context(struct priv *p)
     if (!path || !path[0]) {
         pl_ml_context_destroy(&p->ml_context);
         TA_FREEP(&p->ml_model_path);
-        return;
+    } else if (!p->ml_context || strcmp(p->ml_model_path, path)) {
+        pl_ml_context_destroy(&p->ml_context);
+        TA_FREEP(&p->ml_model_path);
+        MP_INFO(p, "[Zion] Build #%d (%s) — loading model: %s\n",
+                UNPLUGGED_BUILD_NUM, UNPLUGGED_BUILD_DATE, path);
+        p->ml_context = pl_ml_context_create(pl_ml_context_params(
+            .log = p->pllog, .model_path = path));
+        if (p->ml_context)
+            p->ml_model_path = talloc_strdup(p, path);
+        else
+            MP_ERR(p, "Failed loading ML model: %s\n", path);
     }
-    if (p->ml_context && !strcmp(p->ml_model_path, path))
-        return;
-    pl_ml_context_destroy(&p->ml_context);
-    TA_FREEP(&p->ml_model_path);
-    p->ml_context = pl_ml_context_create(pl_ml_context_params(
-        .log = p->pllog, .model_path = path));
-    if (p->ml_context)
-        p->ml_model_path = talloc_strdup(p, path);
-    else
-        MP_ERR(p, "Failed loading ML model: %s\n", path);
+
+    const char *shadow_path = p->next_opts->ml_shadow_model;
+    if (!shadow_path || !shadow_path[0]) {
+        pl_ml_context_destroy(&p->shadow_context);
+        TA_FREEP(&p->shadow_model_path);
+    } else if (!p->shadow_context || strcmp(p->shadow_model_path, shadow_path)) {
+        pl_ml_context_destroy(&p->shadow_context);
+        TA_FREEP(&p->shadow_model_path);
+        MP_INFO(p, "[Zion] loading shadow model: %s\n", shadow_path);
+        p->shadow_context = pl_ml_context_create(pl_ml_context_params(
+            .log = p->pllog, .model_path = shadow_path));
+        if (p->shadow_context)
+            p->shadow_model_path = talloc_strdup(p, shadow_path);
+        else
+            MP_ERR(p, "Failed loading shadow model: %s\n", shadow_path);
+    }
+
+    const char *highlight_path = p->next_opts->ml_highlight_model;
+    if (!highlight_path || !highlight_path[0]) {
+        pl_ml_context_destroy(&p->highlight_context);
+        TA_FREEP(&p->highlight_model_path);
+    } else if (!p->highlight_context || strcmp(p->highlight_model_path, highlight_path)) {
+        pl_ml_context_destroy(&p->highlight_context);
+        TA_FREEP(&p->highlight_model_path);
+        MP_INFO(p, "[Zion] loading highlight model: %s\n", highlight_path);
+        p->highlight_context = pl_ml_context_create(pl_ml_context_params(
+            .log = p->pllog, .model_path = highlight_path));
+        if (p->highlight_context)
+            p->highlight_model_path = talloc_strdup(p, highlight_path);
+        else
+            MP_ERR(p, "Failed loading highlight model: %s\n", highlight_path);
+    }
 }
 
+// Phase 1 (before render): apply cached p->ml_result hooks so they are active
+// during pl_render_image_mix.  Uses the result from the PREVIOUS frame's
+// evaluation — correct 1-frame latency, smoothed by the IIR filter.
+static void apply_ml_hooks(struct vo *vo, struct priv *p, pl_options pars)
+{
+    struct gl_next_opts *opts = p->next_opts;
+    if (!opts->ml_model || !opts->ml_model[0] || !p->ml_context)
+        return;
+    // Reset hook count to base before appending — prevents unbounded growth.
+    pars->params.num_hooks = p->base_num_hooks;
+    int num_ml_hooks = pl_ml_render_get_hooks(&p->ml_result, p->ml_hooks);
+    for (int i = 0; i < num_ml_hooks; i++)
+        MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, &p->ml_hooks[i]);
+    pars->params.hooks = p->hooks;
+}
+
+// Phase 2 (after render): read the peak-detection buf written by
+// pl_shader_detect_peak during the render just completed, run Oracle
+// inference, and update p->ml_result + IIR for the NEXT frame's hooks.
 static void update_ml_render(struct vo *vo, struct priv *p,
                              struct pl_frame_mix *mix, pl_options pars,
                              const struct pl_frame *target)
@@ -1128,23 +1220,70 @@ static void update_ml_render(struct vo *vo, struct priv *p,
     if (target_nits <= 0.0f)
         target_nits = 203.0f; // SDR reference white
 
-    // IIR: scene cut detection using HDR metadata
+    // ── Adaptive Temporal Inertia (Anti-Flicker Engine) ──────────────────────
+    //
+    // Root cause of outdoor flickering: XGBoost binary decision splits are
+    // discontinuous. A 0.1% change in a sky/cloud SAT zone feature can jump
+    // to a different leaf node, causing frame-to-frame gamma jitter. Static
+    // IIR alpha cannot suppress this on stable wide-angle shots.
+    //
+    // Fix: compute scene velocity (frame-to-frame statistical delta), then
+    // derive a dynamic alpha:
+    //   - Stable scene (low velocity) → alpha → 0.02 (heavy inertia, kills jitter)
+    //   - Hard cut (high velocity)    → alpha → 1.0 (snap immediately)
+    //   - Everything else             → interpolate between these extremes
+    //
+    // Plus: XGBoost dead-zone deadband — if new prediction is within
+    // ml_gamma_max_delta of the current IIR value, suppress it entirely.
+
     float l1max = source->color.hdr.max_pq_y;
     float l1avg = source->color.hdr.avg_pq_y;
     bool scene_cut = false;
-    if (p->ml_iir.initialized && opts->ml_iir_alpha < 1.0f) {
-        float l1max_prev = p->ml_iir.l1_max_pq > 0.0f ? p->ml_iir.l1_max_pq : l1max;
-        float l1avg_prev = p->ml_iir.l1_avg_pq > 0.0f ? p->ml_iir.l1_avg_pq : l1avg;
-        if (l1max > 0.01f && fabsf(l1max - l1max_prev) > opts->ml_scene_cut)
-            scene_cut = true;
-        if (l1avg > 0.0f && fabsf(l1avg - l1avg_prev) > opts->ml_scene_cut * 0.67f)
-            scene_cut = true;
-        if (scene_cut)
-            MP_VERBOSE(vo, "ML IIR: scene cut detected (l1max %.3f→%.3f), resetting\n",
-                       l1max_prev, l1max);
+
+    // Update slow EMA baseline (alpha = ml_iir_slow_alpha, default 0.05).
+    // Tracks gradual outdoor drift; abrupt cuts outrun it → detectable delta.
+    float slow_alpha = MPCLAMP(opts->ml_iir_slow_alpha, 0.01f, 0.30f);
+    if (p->ml_iir.initialized) {
+        if (p->ml_iir.l1_max_slow <= 0.0f)
+            p->ml_iir.l1_max_slow = l1max;
+        if (l1max > 0.01f)
+            p->ml_iir.l1_max_slow = slow_alpha * l1max
+                                   + (1.0f - slow_alpha) * p->ml_iir.l1_max_slow;
+    }
+
+    // Measure scene velocity: how far is this frame from the slow baseline?
+    float baseline_max = (p->ml_iir.l1_max_slow > 0.0f && p->ml_iir.initialized)
+                         ? p->ml_iir.l1_max_slow : l1max;
+    float baseline_avg = (p->ml_iir.l1_avg_pq > 0.0f && p->ml_iir.initialized)
+                         ? p->ml_iir.l1_avg_pq : l1avg;
+    float luma_delta = l1avg > 0.0f ? fabsf(l1avg - baseline_avg) : 0.0f;
+    float max_delta  = l1max > 0.01f ? fabsf(l1max - baseline_max) : 0.0f;
+
+    // Genuine hard cut: abrupt jump that outruns the slow baseline
+    if (max_delta > opts->ml_scene_cut * 2.0f ||
+        luma_delta > opts->ml_scene_cut * 1.33f)
+    {
+        scene_cut = true;
+        MP_VERBOSE(vo, "ML IIR: scene cut (max_delta=%.3f luma_delta=%.3f)\n",
+                   max_delta, luma_delta);
     }
     if (scene_cut || !p->ml_iir.initialized)
-        p->ml_iir.initialized = false; // will reinit after this frame
+        p->ml_iir.initialized = false; // will reinit this frame
+
+    // Compute adaptive alpha:
+    //   velocity=0 → fully stable landscape → alpha=alpha_min=0.02 (heavy inertia)
+    //   velocity=1 → high motion / cut      → alpha=alpha_base (~0.10)
+    // Clamp luma_delta to [0,0.25] and max_delta to [0,0.35] per user spec.
+    // velocity=0 → stable scene → should get alpha_min (heavy inertia)
+    // velocity=1 → moving / high delta → should get alpha_base (responsive)
+    float velocity = fmaxf(luma_delta / 0.25f, max_delta / 0.35f);
+    velocity = MPCLAMP(velocity, 0.0f, 1.0f);
+    float alpha_base = MPCLAMP(opts->ml_iir_alpha, 0.01f, 1.0f);
+    float alpha_min  = 0.02f; // minimum alpha for fully stable scenes
+    // velocity drives alpha: stable(0)→alpha_min, moving(1)→alpha_base
+    float A = scene_cut ? 1.0f
+            : alpha_min + velocity * (alpha_base - alpha_min);
+    A = MPCLAMP(A, alpha_min, 1.0f);
 
     // Build ML params — apply IIR smoothed values for AUTO modes
     struct pl_ml_render_params ml_params = {
@@ -1167,50 +1306,96 @@ static void update_ml_render(struct vo *vo, struct priv *p,
             .strength = (opts->ml_radiance_mode == PL_ML_CONTROL_MANUAL &&
                          p->ml_iir.initialized && opts->ml_iir_alpha < 1.0f)
                         ? p->ml_iir.radiance_strength : opts->ml_radiance_strength,
+            .shoulder = opts->ml_radiance_shoulder,
         },
         .chroma_mode          = opts->ml_chroma_mode,
         .chroma_neutral_boost = opts->ml_chroma_neutral_boost,
         .chroma_fire_boost    = opts->ml_chroma_fire_boost,
         .chroma_knee          = opts->ml_chroma_knee,
         .chroma_skin_protect  = opts->ml_chroma_skin_protect,
+        .shadow_model    = p->shadow_context,
+        .shadow_mode     = opts->ml_shadow_mode,
+        .shadow_strength = opts->ml_shadow_strength,
+        .highlight_model    = p->highlight_context,
+        .highlight_mode     = opts->ml_highlight_mode,
+        .highlight_strength = opts->ml_highlight_strength,
         .target_nits          = target_nits,
         .l1_max_pq            = l1max,
         .l1_avg_pq            = l1avg,
-        .feature_cache        = p->ml_feature_cache,
+        .renderer             = p->rr,
     };
 
     int64_t t0 = mp_time_ns();
-    if (!pl_ml_render_evaluate(p->gpu, source, &ml_params, &p->ml_result)) {
+    if (!pl_ml_render_evaluate(&ml_params, &p->ml_result)) {
         MP_WARN(vo, "ML render evaluation failed\n");
         return;
     }
     int64_t t1 = mp_time_ns();
-    MP_VERBOSE(vo, "ML timing: pl_ml_render_evaluate=%.2f ms\n",
+    MP_INFO(vo, "ML timing: pl_ml_render_evaluate=%.2f ms\n",
                (t1 - t0) / 1e6);
 
-    // Update IIR accumulator with this frame's actual rendered values
-    float A = MPCLAMP(opts->ml_iir_alpha, 0.0f, 1.0f);
-    if (!p->ml_iir.initialized || A >= 1.0f) {
-        p->ml_iir.gamma             = p->ml_result.gamma;
-        p->ml_iir.cr_strength       = p->ml_result.cr_strength;
-        p->ml_iir.radiance_strength = p->ml_result.radiance.strength;
-        p->ml_iir.radiance_knee     = p->ml_result.radiance.knee;
-        p->ml_iir.l1_max_pq         = l1max > 0.01f ? l1max : p->ml_iir.l1_max_pq;
-        p->ml_iir.l1_avg_pq         = l1avg > 0.0f  ? l1avg : p->ml_iir.l1_avg_pq;
-        p->ml_iir.initialized       = true;
-    } else {
-        p->ml_iir.gamma             = A * p->ml_result.gamma             + (1.0f-A) * p->ml_iir.gamma;
-        p->ml_iir.cr_strength       = A * p->ml_result.cr_strength       + (1.0f-A) * p->ml_iir.cr_strength;
-        p->ml_iir.radiance_strength = A * p->ml_result.radiance.strength + (1.0f-A) * p->ml_iir.radiance_strength;
-        p->ml_iir.radiance_knee     = A * p->ml_result.radiance.knee     + (1.0f-A) * p->ml_iir.radiance_knee;
-        if (l1max > 0.01f) p->ml_iir.l1_max_pq = l1max;
-        if (l1avg > 0.0f)  p->ml_iir.l1_avg_pq = l1avg;
+    // XGBoost dead-zone deadband: if new gamma prediction is within
+    // ml_gamma_max_delta of the current IIR value (and not a scene cut),
+    // clamp it to the current value entirely — suppresses leaf-node micro-jitter
+    // that is invisible to the eye but drives the IIR to constantly update.
+    float raw_gamma = p->ml_result.gamma;
+    float deadband  = MPCLAMP(opts->ml_gamma_max_delta, 0.0f, 0.20f);
+    if (!scene_cut && p->ml_iir.initialized && deadband > 0.0f) {
+        if (fabsf(raw_gamma - p->ml_iir.gamma) < deadband)
+            raw_gamma = p->ml_iir.gamma; // suppress: prediction inside dead zone
     }
+
+    // Update IIR — but ONLY when the Oracle actually produced a live prediction.
+    //
+    // Bug fix: when Zion Core is OFF (ml-gamma=off), pl_ml_render_evaluate returns
+    // gamma=1.0 (no-op).  Without this guard, the IIR drifts toward 1.0 frame by
+    // frame during the OFF period.  When Zion is toggled back ON, the IIR starts
+    // from ~1.0 and takes 2-3 seconds to converge (looks like "dead state").
+    //
+    // Fix: skip the IIR update when the Oracle didn't fire (model_used=false and
+    // mode is OFF).  The IIR retains its last active value, so toggling back ON
+    // restores the effect in the very next frame — instantaneous toggle.
+    bool oracle_active = (p->ml_result.model_used ||
+                          opts->ml_gamma_mode != PL_ML_CONTROL_OFF);
+
+    if (oracle_active) {
+        if (!p->ml_iir.initialized || A >= 1.0f) {
+            // Snap: first frame after init/scene-cut
+            p->ml_iir.gamma             = raw_gamma;
+            p->ml_iir.cr_strength       = p->ml_result.cr_strength;
+            p->ml_iir.radiance_strength = p->ml_result.radiance.strength;
+            p->ml_iir.radiance_knee     = p->ml_result.radiance.knee;
+            p->ml_iir.l1_max_pq         = l1max > 0.01f ? l1max : p->ml_iir.l1_max_pq;
+            p->ml_iir.l1_avg_pq         = l1avg > 0.0f  ? l1avg : p->ml_iir.l1_avg_pq;
+            p->ml_iir.initialized       = true;
+        } else {
+            // Adaptive blend: A≈0.02 on stable landscape, A≈alpha_base on motion
+            p->ml_iir.gamma             = A * raw_gamma                       + (1.0f-A) * p->ml_iir.gamma;
+            p->ml_iir.cr_strength       = A * p->ml_result.cr_strength       + (1.0f-A) * p->ml_iir.cr_strength;
+            p->ml_iir.radiance_strength = A * p->ml_result.radiance.strength + (1.0f-A) * p->ml_iir.radiance_strength;
+            p->ml_iir.radiance_knee     = A * p->ml_result.radiance.knee     + (1.0f-A) * p->ml_iir.radiance_knee;
+            if (l1max > 0.01f) p->ml_iir.l1_max_pq = l1max;
+            if (l1avg > 0.0f)  p->ml_iir.l1_avg_pq = l1avg;
+        }
+        p->ml_iir.gamma_prev = p->ml_iir.gamma;
+    }
+    // When Oracle is OFF: IIR state is frozen — it retains the last active value.
+    // ml_result still gets written below so apply_ml_hooks uses the correct value.
+
+    // Write IIR-smoothed values back into ml_result so apply_ml_hooks()
+    // renders with the temporally-stable values, not the raw Oracle prediction.
+    // Without this, all the adaptive alpha / deadband work is a no-op on screen.
+    p->ml_result.gamma    = p->ml_iir.gamma;
+    p->ml_result.l2_power = 2048.0f / fmaxf(p->ml_iir.gamma, 0.1f);
+    p->ml_result.cr_strength          = p->ml_iir.cr_strength;
+    p->ml_result.radiance.strength    = p->ml_iir.radiance_strength;
+    p->ml_result.radiance.knee        = p->ml_iir.radiance_knee;
 
     int64_t t2 = mp_time_ns();
     // Log ML state + timing (visible with mpv -v)
-    MP_VERBOSE(vo, "ML: gamma=%.3f(%s) cr=%.3f(%s) rad=%.3f@%.2f(%s) "
-               "chroma=%s fire=%.2f iir=%.2f l1max=%.4f  [eval=%.1fms iir=%.1fms]\n",
+    MP_INFO(vo, "ML: gamma=%.3f(%s) cr=%.3f(%s) rad=%.3f@%.2f(%s) "
+               "chroma=%s fire=%.2f iir=%.2f l1max=%.4f "
+               "shad=%.3f@%.2f hi=%.3f@%.2f  [eval=%.1fms iir=%.1fms]\n",
                p->ml_result.gamma,
                p->ml_result.model_used ? "model" : "fallback",
                p->ml_result.cr_strength,
@@ -1222,15 +1407,14 @@ static void update_ml_render(struct vo *vo, struct priv *p,
                opts->ml_chroma_mode == PL_ML_CONTROL_OFF ? "off" :
                opts->ml_chroma_mode == PL_ML_CONTROL_AUTO ? "auto" : "manual",
                opts->ml_fire_pop_strength, A, l1max,
+               p->ml_result.shadow_strength, p->ml_result.shadow_knee,
+               p->ml_result.highlight_strength, p->ml_result.highlight_knee,
                (t1 - t0) / 1e6, (t2 - t1) / 1e6);
 
-    // Reset hook count to base (GLSL only) before appending ML hooks each frame.
-    // Without this, num_hooks grows by K every frame causing buffer overflow.
-    pars->params.num_hooks = p->base_num_hooks;
-    int num_ml_hooks = pl_ml_render_get_hooks(&p->ml_result, p->ml_hooks);
-    for (int i = 0; i < num_ml_hooks; i++)
-        MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, &p->ml_hooks[i]);
-    pars->params.hooks = p->hooks; // refresh after potential realloc
+    // Hook application happens in apply_ml_hooks() (called before render).
+    // update_ml_render() is called AFTER render — hooks for next frame will
+    // be picked up via p->ml_result on the following apply_ml_hooks() call.
+    (void)pars; // pars unused here now
 }
 
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
@@ -1294,7 +1478,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             p->last_id = 0;
             p->want_reset = false;
             // Reset IIR on seek so previous scene's values don't bleed in
-            p->ml_iir.initialized = false;
+            p->ml_iir.initialized    = false;
+            p->ml_iir.gamma_prev     = 0.0f;
+            p->ml_iir.l1_max_slow    = 0.0f;
             MP_VERBOSE(vo, "ML IIR: reset on seek\n");
         }
 
@@ -1637,14 +1823,21 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             update_hook_opts_dynamic(p, p->hooks[i], frame->current);
     }
 
-    // Apply ML rendering hooks
-    update_ml_render(vo, p, &mix, pars, &target);
+    // Phase 1: apply hooks from p->ml_result (previous frame's evaluation).
+    // The hooks must be registered before pl_render_image_mix so they execute
+    // during this frame's render.
+    apply_ml_hooks(vo, p, pars);
 
-    // Render frame
+    // Render frame — pl_shader_detect_peak fires here, writing the peak buf
+    // for THIS frame.  The buf is readable immediately after this returns.
     if (!pl_render_image_mix(p->rr, &mix, &target, &params)) {
         MP_ERR(vo, "Failed rendering frame!\n");
         goto done;
     }
+
+    // Phase 2: read the peak buf written above, run Oracle inference, update
+    // p->ml_result.  Next frame's apply_ml_hooks() will use this result.
+    update_ml_render(vo, p, &mix, pars, &target);
 
     struct pl_frame ref_frame;
     pl_frames_infer_mix(p->rr, &mix, &target, &ref_frame);
@@ -1808,6 +2001,10 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
     struct pl_peak_detect_params peak_params;
     if (params.peak_detect_params) {
         peak_params = *params.peak_detect_params;
+        // Always allow delayed readback so pl_shader_detect_peak is never
+        // permanently disabled by the fbofmt[4] gate.  The Oracle IIR is
+        // designed for 1-frame latency anyway, so this has no quality cost.
+        peak_params.allow_delayed = true;
         params.peak_detect_params = &peak_params;
         peak_params.allow_delayed = false;
     }
@@ -2356,7 +2553,6 @@ static void uninit(struct vo *vo)
     pl_renderer_destroy(&p->rr);
 
     pl_ml_context_destroy(&p->ml_context);
-    pl_ml_feature_cache_destroy(&p->ml_feature_cache);
     TA_FREEP(&p->ml_model_path);
 
     for (int i = 0; i < VO_PASS_PERF_MAX; ++i) {
@@ -2426,8 +2622,6 @@ static int preinit(struct vo *vo)
     p->pars = pl_options_alloc(p->pllog);
     update_render_options(vo);
     update_ml_context(p);  // pre-load XGBoost model before first frame
-    // Create persistent feature extraction cache (reuses luma tex + renderer each frame)
-    p->ml_feature_cache = pl_ml_feature_cache_create(p->gpu, 256, 144);
     return 0;
 
 err_out:
