@@ -1238,6 +1238,18 @@ static void update_ml_render(struct vo *vo, struct priv *p,
 
     float l1max = source->color.hdr.max_pq_y;
     float l1avg = source->color.hdr.avg_pq_y;
+
+    // SDR / non-RPU sources carry no L1 metadata (max_pq_y == 0), which
+    // starves the scene-cut/IIR engine and reports l1max=0 forever. Fall back
+    // to the detected ML features so the temporal engine sees real luma
+    // movement on SDR (Phase B-1). Never triggers for HDR-with-L1 content.
+    if (l1max <= 0.0f && l1avg <= 0.0f) {
+        float detected[78];
+        if (pl_renderer_get_ml_features(p->rr, target_nits, detected)) {
+            l1max = detected[0];   // detected max (signal-domain luma)
+            l1avg = detected[1];   // detected average
+        }
+    }
     bool scene_cut = false;
 
     // Update slow EMA baseline (alpha = ml_iir_slow_alpha, default 0.05).
@@ -1322,6 +1334,7 @@ static void update_ml_render(struct vo *vo, struct priv *p,
         .target_nits          = target_nits,
         .l1_max_pq            = l1max,
         .l1_avg_pq            = l1avg,
+        .is_sdr               = !pl_color_space_is_hdr(&source->color),
         .renderer             = p->rr,
     };
 
@@ -1331,8 +1344,8 @@ static void update_ml_render(struct vo *vo, struct priv *p,
         return;
     }
     int64_t t1 = mp_time_ns();
-    MP_INFO(vo, "ML timing: pl_ml_render_evaluate=%.2f ms\n",
-               (t1 - t0) / 1e6);
+    MP_TRACE(vo, "ML timing: pl_ml_render_evaluate=%.2f ms\n",
+             (t1 - t0) / 1e6);
 
     // XGBoost dead-zone deadband: if new gamma prediction is within
     // ml_gamma_max_delta of the current IIR value (and not a scene cut),
@@ -1393,7 +1406,11 @@ static void update_ml_render(struct vo *vo, struct priv *p,
 
     int64_t t2 = mp_time_ns();
     // Log ML state + timing (visible with mpv -v)
-    MP_INFO(vo, "ML: gamma=%.3f(%s) cr=%.3f(%s) rad=%.3f@%.2f(%s) "
+    // Log the ML state at ~1 line/second instead of every frame (60 fps → the
+    // log ballooned to megabytes, hurting perf and burying real signals).
+    static unsigned ml_log_ctr = 0;
+    if (ml_log_ctr++ % 30 == 0)
+        MP_INFO(vo, "ML: gamma=%.3f(%s) cr=%.3f(%s) rad=%.3f@%.2f(%s) "
                "chroma=%s fire=%.2f iir=%.2f l1max=%.4f "
                "shad=%.3f@%.2f hi=%.3f@%.2f  [eval=%.1fms iir=%.1fms]\n",
                p->ml_result.gamma,
