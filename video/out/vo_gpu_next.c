@@ -1947,7 +1947,7 @@ done:
     if (frame->current && p->next_opts->ml_acq_warm_hold) {
         static int dbg;
         if ((dbg++ % 60) == 0) {
-            double now = mp_time_now();
+            double now = mp_time_sec();
             int age_ms = (int)((now - frame->current->pts) * 1000);
             MP_INFO(vo, "VP frame age: %d ms\n", age_ms);
         }
