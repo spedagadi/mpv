@@ -545,6 +545,8 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     dst->pts = src->pts;
     dst->dts = src->dts;
     dst->pkt_duration = src->pkt_duration;
+    dst->ingest_mono = src->ingest_mono;
+    dst->decode_mono = src->decode_mono;
     dst->params.vflip = src->params.vflip;
     dst->params.rotate = src->params.rotate;
     dst->params.stereo3d = src->params.stereo3d;

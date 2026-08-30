@@ -33,6 +33,7 @@
 #include "common/msg.h"
 #include "options/m_config.h"
 #include "options/options.h"
+#include "osdep/timer.h"
 #include "osdep/threads.h"
 #include "misc/bstr.h"
 #include "common/av_common.h"
@@ -201,6 +202,10 @@ typedef struct lavc_ctx {
     AVCodecContext *avctx;
     AVFrame *pic;
     AVPacket *avpkt;
+    // ingest_mono of the most recently consumed packet, copied onto each
+    // decoded frame. With B-frame reordering this can map a frame to a
+    // slightly-newer packet; acceptable for the latency histogram.
+    double last_ingest_mono;
     bool use_hwdec;
     struct hwdec_info hwdec; // valid only if use_hwdec==true
     bstr *attempted_hwdecs;
@@ -1184,6 +1189,8 @@ static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
         return 0;
 
     mp_set_av_packet(ctx->avpkt, pkt, &ctx->codec_timebase);
+    if (pkt)
+        ctx->last_ingest_mono = pkt->ingest_mono;
 
     int ret = avcodec_send_packet(avctx, pkt ? ctx->avpkt : NULL);
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
@@ -1269,6 +1276,10 @@ static int decode_frame(struct mp_filter *vd)
     mpi->pts = mp_pts_from_av(ctx->pic->pts, &ctx->codec_timebase);
     mpi->dts = mp_pts_from_av(ctx->pic->pkt_dts, &ctx->codec_timebase);
     mpi->pkt_duration = mp_pts_from_av(ctx->pic->duration, &ctx->codec_timebase);
+    // Carry the source-packet ingest stamp for the latency histograms.
+    mpi->ingest_mono = ctx->last_ingest_mono;
+    // Decode-out stage stamp: time the decoded frame leaves the decoder.
+    mpi->decode_mono = mp_time_sec();
 
     av_frame_unref(ctx->pic);
 

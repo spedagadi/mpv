@@ -99,6 +99,10 @@ typedef struct mp_image {
 
     /* only inside filter chain */
     double pts;
+    // Stage clock stamps for the VP per-stage latency histograms. All in the
+    // same monotonic family (mp_time_sec()); 0 == unknown/missing stage.
+    double ingest_mono;   // demux read of the source packet (see demux_packet)
+    double decode_mono;   // decoder output (first half of "decoded" stage)
     /* only after decoder */
     double dts, pkt_duration;
     /* container reported FPS; can be incorrect, or 0 if unknown */

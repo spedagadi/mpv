@@ -167,6 +167,7 @@ void demux_packet_copy_attribs(struct demux_packet *dst, struct demux_packet *sr
     dst->pts = src->pts;
     dst->dts = src->dts;
     dst->duration = src->duration;
+    dst->ingest_mono = src->ingest_mono;
     dst->pos = src->pos;
     dst->is_wrapped_avframe = src->is_wrapped_avframe;
     dst->segmented = src->segmented;

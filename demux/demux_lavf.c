@@ -42,6 +42,7 @@
 
 #include "common/common.h"
 #include "common/msg.h"
+#include "osdep/timer.h"
 #include "common/tags.h"
 #include "common/av_common.h"
 #include "misc/bstr.h"
@@ -1258,6 +1259,9 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
         av_packet_free(&pkt);
         return true;
     }
+
+    // VP latency tooling: stamp the frame-lifetime origin (see packet.h).
+    dp->ingest_mono = mp_time_sec();
 
     if (priv->pcm_seek_hack == st && !priv->pcm_seek_hack_packet_size)
         priv->pcm_seek_hack_packet_size = pkt->size;

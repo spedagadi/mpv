@@ -117,6 +117,35 @@ struct cache {
     pl_cache cache;
 };
 
+// VP latency instrument: histogram buckets for stage ages.
+// 0..19 = 10 ms bins over 0..200 ms, then 200–300, 300–500, >500 ms.
+#define INGEST_NUM_BUCKETS 23
+
+// VP latency instrument: pipeline stages that get their own age histograms.
+// Each delta is between two frame stamps, all in the mp_time_sec() domain.
+enum {
+    ST_INGEST_DECODE = 0,  // demux read → decoder output
+    ST_DECODE_VO,          // decoder output → VO entry (filter/core transit)
+    ST_VO_WAIT,            // VO entry → render start (pl_queue / vsync hold)
+    ST_RENDER,             // render start → render done (tonemap + feature
+                           //   extraction + all GPU ML hooks)
+    ST_ML_POST,            // render done → ML post done (pl_ml_render_evaluate:
+                           //   Oracle + Construct CR + radiance/chroma/hi/shad + IIR)
+    ST_TO_PRESENT,         // ML post done → present (swapchain/FIFO hold)
+    ST_TOTAL,              // ingest → present (legacy whole-pipeline age)
+    NUM_ML_STAGES
+};
+
+static const char *ingest_stage_labels[NUM_ML_STAGES] = {
+    "ingest->decode",
+    "decode->VO",
+    "VO-wait",
+    "RENDER (tonemap+feat+hooks)",
+    "ML post (Oracle+CR+...)",
+    "queue->present",
+    "TOTAL ingest->present",
+};
+
 struct priv {
     struct mp_log *log;
     struct mpv_global *global;
@@ -162,6 +191,26 @@ struct priv {
     int base_num_hooks;           // hook count after GLSL shaders, before ML hooks
     struct pl_hook ml_hooks[7];   // SDR→P5 emulation (if active), shadow, fire, L2, radiance, chroma, highlight
     int render_frame_cnt;        // frames rendered (VP acq warm-up hold)
+
+    // VP latency instrument (--ml-acq-stats): ingest→present age histogram.
+    // last_ingest_mono pairs the frame drawn by draw_frame with the present
+    // in flip_page (1:1 in the pull model) so age = now − ingest, one clock.
+    double last_ingest_mono;          // stage stamps of the frame in flight
+    double last_decode_mono;          // (drawn in draw_frame, presented in flip)
+    double st_vo_in, st_render_start, st_render_end, st_ml_end;
+    bool   ingest_stats_on;
+    bool   ingest_stats_done;         // collection finished; stay inert
+    bool   ingest_startup_dumped;
+    double ingest_stats_start;        // mp_time of first accepted sample
+    int    ingest_stats_secs;         // configured total seconds (steady window)
+    int    ingest_last_win;
+    int    ingest_period_cnt;         // periodic running-report counter
+    // per-stage, per-window ([0]=startup, [1]=steady) accumulators
+    int    ingest_samples[NUM_ML_STAGES][2];
+    double ingest_sum[NUM_ML_STAGES][2];
+    double ingest_min[NUM_ML_STAGES][2];
+    double ingest_max[NUM_ML_STAGES][2];
+    int    ingest_buckets[NUM_ML_STAGES][2][INGEST_NUM_BUCKETS];
     pl_ml_context ml_context;
     char *ml_model_path;
     pl_ml_context shadow_context;
@@ -251,6 +300,7 @@ struct gl_next_opts {
     float ml_sdr_strength;   // shaped mid-lift strength (0..1) for the bridge
     bool ml_acq_warm_hold;     // VP acq: present black until ML/shaders warm
     int  ml_acq_warm_frames;   // min frames rendered before the hold releases
+    int  ml_acq_stats;         // VP latency histogram: seconds to collect (0=off)
     char **raw_opts;
 };
 
@@ -326,6 +376,7 @@ const struct m_sub_options gl_next_conf = {
         {"ml-sdr-strength",     OPT_FLOAT(ml_sdr_strength),     M_RANGE(0.0, 1.0)},
         {"ml-acq-warm-hold",     OPT_BOOL(ml_acq_warm_hold)},
         {"ml-acq-warm-frames",   OPT_INT(ml_acq_warm_frames), M_RANGE(1, 240)},
+        {"ml-acq-stats",         OPT_INT(ml_acq_stats), M_RANGE(0, 600)},
         // No `target-lut-type` because we don't support non-RGB targets
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
@@ -347,6 +398,7 @@ const struct m_sub_options gl_next_conf = {
         .ml_sdr_virtual_nits  = 1000.0f,
         .ml_sdr_strength     = 0.5f,
         .ml_acq_warm_frames  = 5,
+        .ml_acq_stats        = 0,
         .ml_chroma_neutral_boost = 1.20f,
         .ml_chroma_fire_boost = 1.35f,
         .ml_chroma_knee = 0.55f,
@@ -1885,16 +1937,23 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // during this frame's render.
     apply_ml_hooks(vo, p, pars);
 
+    // VP latency instrument: RENDER stage (tonemap + feature extraction +
+    // all GPU ML hooks) is the pl_render_image_mix wall-time.
+    p->st_render_start = mp_time_sec();
+
     // Render frame — pl_shader_detect_peak fires here, writing the peak buf
     // for THIS frame.  The buf is readable immediately after this returns.
     if (!pl_render_image_mix(p->rr, &mix, &target, &params)) {
         MP_ERR(vo, "Failed rendering frame!\n");
         goto done;
     }
+    p->st_render_end = mp_time_sec();
 
     // Phase 2: read the peak buf written above, run Oracle inference, update
     // p->ml_result.  Next frame's apply_ml_hooks() will use this result.
     update_ml_render(vo, p, &mix, pars, &target);
+    // VP latency instrument: ML post stage ends here (Oracle + CR + IIR CPU).
+    p->st_ml_end = mp_time_sec();
 
     struct pl_frame ref_frame;
     pl_frames_infer_mix(p->rr, &mix, &target, &ref_frame);
@@ -1940,6 +1999,14 @@ done:
     pl_gpu_flush(gpu);
     p->frame_pending = true;
 
+    // VP latency instrument: capture the stage stamps of the frame being
+    // presented (decode-out rides the image; VO entry is stamped here).
+    if (frame->current) {
+        p->last_ingest_mono = frame->current->ingest_mono;
+        p->last_decode_mono = frame->current->decode_mono;
+        p->st_vo_in = mp_time_sec();
+    }
+
     // VP latency diagnostic: with video_pts=wallclock each frame carries its
     // capture wall-clock PTS, so `now - pts` is the true presented age of the
     // frame just swapped. Throttled ~1/s; only when the capture warm-up hold
@@ -1956,18 +2023,175 @@ done:
     return VO_TRUE;
 }
 
+// VP latency instrument — bucket mapping for the ingest→present age histogram.
+static int ingest_bucket(double age_ms)
+{
+    if (age_ms < 200.0)
+        return (int)(age_ms / 10.0);
+    if (age_ms < 300.0)
+        return 20;
+    if (age_ms < 500.0)
+        return 21;
+    return 22;
+}
+
+static double ingest_bucket_upper(int b)
+{
+    if (b < 20)
+        return (b + 1) * 10.0;
+    if (b == 20)
+        return 300.0;
+    if (b == 21)
+        return 500.0;
+    return 600.0;
+}
+
+static const char *ingest_bucket_label(int b)
+{
+    static char buf[16];
+    if (b < 20) {
+        snprintf(buf, sizeof(buf), "%3d-%3dms", b * 10, (b + 1) * 10);
+        return buf;
+    }
+    if (b == 20)
+        return "200-300ms";
+    if (b == 21)
+        return "300-500ms";
+    return "  >500ms";
+}
+
+static void ingest_stats_stage_print(struct vo *vo, int stage, int win)
+{
+    struct priv *p = vo->priv;
+    int n = p->ingest_samples[stage][win];
+    if (n <= 0)
+        return;
+
+    double mean = p->ingest_sum[stage][win] / n;
+    int target = (n * 95 + 99) / 100;
+    int cum = 0;
+    double p95 = 0;
+    int max_count = 0;
+    for (int i = 0; i < INGEST_NUM_BUCKETS; i++) {
+        cum += p->ingest_buckets[stage][win][i];
+        if (cum >= target && p95 == 0)
+            p95 = ingest_bucket_upper(i);
+        if (p->ingest_buckets[stage][win][i] > max_count)
+            max_count = p->ingest_buckets[stage][win][i];
+    }
+
+    double t0 = win ? 2.0 : 0.0;
+    double t1 = win ? 2.0 + p->ingest_stats_secs : 2.0;
+    MP_INFO(vo, "[stages] %s window (%.1f-%.1fs) %-24s n=%d  "
+                "mean=%.1fms p95=%.0fms max=%.0fms\n",
+            win ? "steady" : "startup", t0, t1,
+            ingest_stage_labels[stage], n, mean, p95, p->ingest_max[stage][win]);
+
+    static const char bar[] = "########################################";
+    for (int i = 0; i < INGEST_NUM_BUCKETS; i++) {
+        int c = p->ingest_buckets[stage][win][i];
+        if (!c)
+            continue;
+        int nbar = max_count ? (40 * c + max_count - 1) / max_count : 0;
+        MP_INFO(vo, "[stages]   %-12s | %5d  %.*s\n",
+                ingest_bucket_label(i), c, nbar, bar);
+    }
+}
+
+static void ingest_stats_print_all(struct vo *vo, int win)
+{
+    for (int s = 0; s < NUM_ML_STAGES; s++)
+        ingest_stats_stage_print(vo, s, win);
+}
+
+static void ingest_stats_sample(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    double now = mp_time_sec();
+    if (p->ingest_stats_done)
+        return;
+
+    // Stage boundary stamps of the frame just presented (draw→flip, 1:1).
+    const double st[7] = {
+        p->last_ingest_mono,    // T0  demux read
+        p->last_decode_mono,    // T1  decode out
+        p->st_vo_in,            // T2  VO entry
+        p->st_render_start,     // T3  render start
+        p->st_render_end,       // T4  render done
+        p->st_ml_end,           // T5  ML post done
+        now,                    // T6  present
+    };
+    double d[NUM_ML_STAGES];
+    for (int s = 0; s < ST_TOTAL; s++)
+        d[s] = st[s + 1] - st[s];
+    d[ST_TOTAL] = st[6] - st[0];
+
+    if (!p->ingest_stats_on) {
+        p->ingest_stats_on = true;
+        p->ingest_stats_start = now;
+        p->ingest_stats_secs = p->next_opts->ml_acq_stats;
+        p->ingest_last_win = 0;
+    }
+
+    double el = now - p->ingest_stats_start;
+    int win = el < 2.0 ? 0 : 1;
+
+    // Accumulate every valid stage delta into that stage's histogram.
+    for (int s = 0; s < NUM_ML_STAGES; s++) {
+        double ms = d[s] * 1000.0;
+        if (ms <= 0)
+            continue;
+        p->ingest_samples[s][win]++;
+        p->ingest_sum[s][win] += ms;
+        if (p->ingest_min[s][win] == 0 || ms < p->ingest_min[s][win])
+            p->ingest_min[s][win] = ms;
+        if (ms > p->ingest_max[s][win])
+            p->ingest_max[s][win] = ms;
+        p->ingest_buckets[s][win][ingest_bucket(ms)]++;
+    }
+
+    // startup → steady transition: dump the startup window once.
+    if (win == 1 && !p->ingest_startup_dumped) {
+        p->ingest_startup_dumped = true;
+        ingest_stats_print_all(vo, 0);
+    }
+
+    // every 60 samples: compact running report (whole-pipeline age)
+    if (++p->ingest_period_cnt % 60 == 0) {
+        int n = p->ingest_samples[ST_TOTAL][win];
+        if (n)
+            MP_INFO(vo, "[ingest] %s window, %d samples: mean=%.0fms max=%.0fms\n",
+                    win ? "steady" : "startup", n,
+                    p->ingest_sum[ST_TOTAL][win] / n,
+                    p->ingest_max[ST_TOTAL][win]);
+    }
+
+    // steady window complete → final per-stage histograms, then stop.
+    if (el >= 2.0 + p->ingest_stats_secs) {
+        ingest_stats_print_all(vo, 1);
+        p->ingest_stats_on = false;
+        p->ingest_stats_done = true;
+    }
+}
+
 static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
 
-    if (p->frame_pending) {
+    bool new_frame = p->frame_pending;
+    if (new_frame) {
         if (!pl_swapchain_submit_frame(p->sw))
             MP_ERR(vo, "Failed presenting frame!\n");
         p->frame_pending = false;
     }
 
     sw->fns->swap_buffers(sw);
+
+    // VP latency instrument: sample once per freshly presented frame, at the
+    // present boundary (age = now − ingest of the frame that just flipped).
+    if (new_frame && p->next_opts->ml_acq_stats > 0 && p->last_ingest_mono > 0)
+        ingest_stats_sample(vo);
 }
 
 static void get_vsync(struct vo *vo, struct vo_vsync_info *info)

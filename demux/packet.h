@@ -27,6 +27,10 @@ typedef struct demux_packet {
     double pts;
     double dts;
     double duration;
+    // Monotonic time (mp_time_sec()) when this packet was read from the
+    // source. Set at the demuxer read point so every frame carries its own
+    // "ingest" timestamp; used by the VP frame-lifetime histogram tooling.
+    double ingest_mono;
     int64_t pos;        // position in source file byte stream
 
     union {
