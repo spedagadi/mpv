@@ -265,6 +265,11 @@ typedef struct MPOpts {
     int autosync;
     int frame_dropping;
     bool video_latency_hacks;
+    // VP acquisition queue-drain (--ml-acq-drain): only push a decoded frame
+    // into the decode→VO queue once that queue has flushed to 0, so the first
+    // presented frames come from a drained, live feed instead of the warm-up
+    // backlog. Auto-disarms ~2s after the first frame.
+    bool ml_acq_drain;
     int term_osd;
     bool term_osd_bar;
     char *term_osd_bar_chars;

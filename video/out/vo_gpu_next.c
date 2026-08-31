@@ -192,6 +192,16 @@ struct priv {
     struct pl_hook ml_hooks[7];   // SDR→P5 emulation (if active), shadow, fire, L2, radiance, chroma, highlight
     int render_frame_cnt;        // frames rendered (VP acq warm-up hold)
 
+    // VP present-gate (--ml-acq-cutover): hold black until a frame younger
+    // than the ceiling is presented; re-armed when the ingest timeline jumps
+    // backwards (decklink reconnect re-anchors the stream).
+    bool   cutover_live;
+    int    cutover_streak;       // consecutive young (age≤N) frames in a row
+    double cutover_t0;           // mp_time_sec() when the hold started (0=unset)
+    double cutover_last_ingest;  // previous frame's ingest stamp (re-arm detect)
+    bool   gate_black;           // this draw was presented black (warm/cutover)
+                                   // → skip the ingest histogram sample
+
     // VP latency instrument (--ml-acq-stats): ingest→present age histogram.
     // last_ingest_mono pairs the frame drawn by draw_frame with the present
     // in flip_page (1:1 in the pull model) so age = now − ingest, one clock.
@@ -301,6 +311,8 @@ struct gl_next_opts {
     bool ml_acq_warm_hold;     // VP acq: present black until ML/shaders warm
     int  ml_acq_warm_frames;   // min frames rendered before the hold releases
     int  ml_acq_stats;         // VP latency histogram: seconds to collect (0=off)
+    int  ml_acq_cutover;       // present-gate ceiling (ms, 0=off): hold black
+                               // while the in-flight frame is older than this
     char **raw_opts;
 };
 
@@ -377,6 +389,7 @@ const struct m_sub_options gl_next_conf = {
         {"ml-acq-warm-hold",     OPT_BOOL(ml_acq_warm_hold)},
         {"ml-acq-warm-frames",   OPT_INT(ml_acq_warm_frames), M_RANGE(1, 240)},
         {"ml-acq-stats",         OPT_INT(ml_acq_stats), M_RANGE(0, 600)},
+        {"ml-acq-cutover",       OPT_INT(ml_acq_cutover), M_RANGE(0, 2000)},
         // No `target-lut-type` because we don't support non-RGB targets
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
@@ -399,6 +412,7 @@ const struct m_sub_options gl_next_conf = {
         .ml_sdr_strength     = 0.5f,
         .ml_acq_warm_frames  = 5,
         .ml_acq_stats        = 0,
+        .ml_acq_cutover      = 0,
         .ml_chroma_neutral_boost = 1.20f,
         .ml_chroma_fire_boost = 1.35f,
         .ml_chroma_knee = 0.55f,
@@ -1986,10 +2000,48 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // decision). NOTE: gating on ML IIR initialization is unreliable in
     // capture (can stall the Oracle), which black-screened the rig — frame
     // count only.
+    p->gate_black = false;
     p->render_frame_cnt++;
     if (p->next_opts->ml_acq_warm_hold &&
-        p->render_frame_cnt < p->next_opts->ml_acq_warm_frames)
+        p->render_frame_cnt < p->next_opts->ml_acq_warm_frames) {
         pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
+        p->gate_black = true;
+    }
+
+    // VP present-gate (--ml-acq-cutover): the frame reaching draw is already
+    // as old as its staging-FIFO wait (probes: frames are fresh at decode,
+    // the 100ms poll accumulates pre-VO). Until a frame younger than the
+    // ceiling reaches the present edge we still render it (keeps ML/peaks
+    // warm) but output BLACK — the acquisition tail never hits the eye/AVR.
+    // Re-arm when the ingest timeline jumps backwards (decklink reconnect).
+    if (p->next_opts->ml_acq_cutover > 0 && frame->current &&
+        frame->current->ingest_mono > 0.0)
+    {
+        double ingest = frame->current->ingest_mono;
+        double age_ms = (mp_time_sec() - ingest) * 1000.0;
+        if (p->cutover_last_ingest > 0.0 && ingest < p->cutover_last_ingest - 0.05) {
+            p->cutover_live = false;
+            p->cutover_t0 = mp_time_sec();
+        }
+        p->cutover_last_ingest = ingest;
+        if (!p->cutover_live) {
+            if (p->cutover_t0 <= 0.0)
+                p->cutover_t0 = mp_time_sec();
+            bool young = age_ms <= p->next_opts->ml_acq_cutover;
+            p->cutover_streak = young ? p->cutover_streak + 1 : 0;
+            if (p->cutover_streak >= 6 ||
+                mp_time_sec() - p->cutover_t0 > 3.0)
+            {
+                // sustained young run (or anti-flap release) → live
+                p->cutover_live = true;
+            } else if (!young) {
+                // stall frame: keep present black so the acquisition tail
+                // never reaches the eye/AVR
+                pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
+                p->gate_black = true;
+            }
+        }
+    }
     // fall through
 
 done:
@@ -2017,6 +2069,21 @@ done:
             double now = mp_time_sec();
             int age_ms = (int)((now - frame->current->pts) * 1000);
             MP_INFO(vo, "VP frame age: %d ms\n", age_ms);
+            // capture(stamp)→demux-read split: isolates the decklink ring /
+            // transport delay from the mpv-internal pipeline. Positive means
+            // the card's wallclock stamp led our read.
+            double cap2read = (frame->current->pts - frame->current->ingest_mono) * 1000.0;
+            MP_INFO(vo, "CAP2READ: %.0f ms (pts=%.3f ingest=%.3f)\n",
+                    cap2read, frame->current->pts, frame->current->ingest_mono);
+            // CLOCK BASES: pts uses av_gettime_relative (ffmpeg-era base),
+            // ingest uses mp_time_sec (mpv base). Their DIFFERENCE is the
+            // origin gap — if it matches CAP2READ, the "delay" is a clock
+            // artifact, not capture latency.
+            extern int64_t av_gettime_relative(void);
+            double avnow = av_gettime_relative() * 1e-6;
+            double mpnow = mp_time_sec();
+            MP_INFO(vo, "CLOCKOFF: mpnow=%.3f avnow=%.3f delta=%.0f ms\n",
+                    mpnow, avnow, (mpnow - avnow) * 1000.0);
         }
     }
 
@@ -2190,8 +2257,12 @@ static void flip_page(struct vo *vo)
 
     // VP latency instrument: sample once per freshly presented frame, at the
     // present boundary (age = now − ingest of the frame that just flipped).
-    if (new_frame && p->next_opts->ml_acq_stats > 0 && p->last_ingest_mono > 0)
+    // Frames presented black (warm-up hold / cutover gate) don't count —
+    // the histogram must reflect only what actually hit the eye.
+    if (new_frame && p->next_opts->ml_acq_stats > 0 && p->last_ingest_mono > 0 &&
+        !p->gate_black)
         ingest_stats_sample(vo);
+    p->gate_black = false;
 }
 
 static void get_vsync(struct vo *vo, struct vo_vsync_info *info)

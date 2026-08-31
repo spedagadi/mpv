@@ -117,6 +117,9 @@ void reset_video_state(struct MPContext *mpctx)
     mpctx->total_avsync_change = 0;
     mpctx->last_av_difference = 0;
     mpctx->mistimed_frames_total = 0;
+    // Re-arm --ml-acq-drain on every stream/config reset (decklink reconnect).
+    mpctx->drain_active = mpctx->opts->ml_acq_drain;
+    mpctx->drain_t0 = 0.0;
     mpctx->drop_message_shown = 0;
     mpctx->display_sync_drift_dir = 0;
     mpctx->display_sync_error = 0;
@@ -448,6 +451,22 @@ static void add_new_frame(struct MPContext *mpctx, struct mp_image *frame)
 {
     mp_assert(mpctx->num_next_frames < MP_ARRAY_SIZE(mpctx->next_frames));
     mp_assert(frame);
+
+    // --ml-acq-drain: wait for the decode→VO queue to flush to 0 before
+    // pushing a new frame. First presented frames then come from a drained,
+    // live feed instead of the warm-up backlog. Auto-disarms ~2s in so the
+    // steady-state pipeline is untouched.
+    if (mpctx->opts->ml_acq_drain && mpctx->drain_active) {
+        if (mpctx->drain_t0 <= 0.0)
+            mpctx->drain_t0 = mp_time_sec();
+        if (mpctx->num_next_frames > 0) {
+            mp_image_unrefp(&frame);
+            return;
+        }
+        if (mp_time_sec() - mpctx->drain_t0 >= 2.0)
+            mpctx->drain_active = false;
+    }
+
     mpctx->next_frames[mpctx->num_next_frames++] = frame;
     if (mpctx->num_next_frames == 1)
         handle_new_frame(mpctx);

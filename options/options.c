@@ -809,6 +809,7 @@ static const m_option_t mp_opts[] = {
         {"decoder", 2},
         {"decoder+vo", 3})},
     {"video-latency-hacks", OPT_BOOL(video_latency_hacks)},
+    {"ml-acq-drain", OPT_BOOL(ml_acq_drain)},
 
     {"untimed", OPT_BOOL(untimed)},
 
