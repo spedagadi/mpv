@@ -23,6 +23,7 @@
 #include <libplacebo/colorspace.h>
 #include <libplacebo/options.h>
 #include <libplacebo/renderer.h>
+#include <libplacebo/ml_features.h>
 #include <libplacebo/ml_render.h>
 #include <libplacebo/shaders/lut.h>
 #include <libplacebo/shaders/icc.h>
@@ -189,7 +190,7 @@ struct priv {
     const struct pl_hook **hooks; // storage for `params.hooks`
     const struct pl_hook **active_hooks;
     int base_num_hooks;           // hook count after GLSL shaders, before ML hooks
-    struct pl_hook ml_hooks[7];   // SDR→P5 emulation (if active), shadow, fire, L2, radiance, chroma, highlight
+    struct pl_hook ml_hooks[8];   // SDR→P5, shadow, fire, L2, CR bilateral, radiance, chroma, highlight
     int render_frame_cnt;        // frames rendered (VP acq warm-up hold)
 
     // VP present-gate (--ml-acq-cutover): hold black until a frame younger
@@ -228,6 +229,12 @@ struct priv {
     pl_ml_context highlight_context;
     char *highlight_model_path;
     struct pl_ml_render_result ml_result;
+    // Trained P(skin) chroma LUT (--ml-chroma-skin-lut), owned by p->gpu.
+    pl_tex ml_skin_lut;
+    pl_gpu ml_skin_lut_gpu;
+    char  *ml_skin_lut_path;       // cached option path (hot-reload strcmp)
+    float  ml_skin_lut_cr0, ml_skin_lut_cr1;
+    float  ml_skin_lut_cb0, ml_skin_lut_cb1;
     struct pl_color_map_params ml_color_map;
     enum pl_color_levels output_levels;
 
@@ -245,6 +252,8 @@ struct priv {
         float cr_strength;
         float radiance_strength;
         float radiance_knee;
+        float l2_highlight_guard;
+        float l2_midtone_boost;
     } ml_iir;
 
     struct pl_icc_params icc_params;
@@ -264,6 +273,7 @@ struct priv {
 
 static void update_render_options(struct vo *vo);
 static void update_lut(struct priv *p, struct user_lut *lut);
+static void update_skin_lut(struct priv *p);
 
 struct gl_next_opts {
     bool delayed_peak;
@@ -301,6 +311,8 @@ struct gl_next_opts {
     float ml_chroma_fire_boost;
     float ml_chroma_knee;
     float ml_chroma_skin_protect;
+    float ml_chroma_warm_damp;      // [0..1] warm-sector chroma-gain pullback
+    char *ml_chroma_skin_lut;       // trained P(skin) chroma LUT (.bin), M_OPT_FILE
     float ml_iir_alpha;
     float ml_scene_cut;
     float ml_gamma_max_delta;  // hard cap on gamma change per frame (0=disabled)
@@ -379,6 +391,8 @@ const struct m_sub_options gl_next_conf = {
         {"ml-chroma-fire", OPT_FLOAT(ml_chroma_fire_boost), M_RANGE(1.0, 1.5)},
         {"ml-chroma-knee", OPT_FLOAT(ml_chroma_knee), M_RANGE(0.1, 0.9)},
         {"ml-chroma-skin", OPT_FLOAT(ml_chroma_skin_protect), M_RANGE(0.5, 1.0)},
+        {"ml-chroma-skin-lut", OPT_STRING(ml_chroma_skin_lut), .flags = M_OPT_FILE},
+        {"ml-chroma-warm-damp", OPT_FLOAT(ml_chroma_warm_damp), M_RANGE(0.0, 1.0)},
         {"ml-iir-alpha",       OPT_FLOAT(ml_iir_alpha),       M_RANGE(0.0, 1.0)},
         {"ml-scene-cut",       OPT_FLOAT(ml_scene_cut),       M_RANGE(0.0, 0.5)},
         {"ml-gamma-max-delta", OPT_FLOAT(ml_gamma_max_delta), M_RANGE(0.0, 0.20)},
@@ -417,6 +431,7 @@ const struct m_sub_options gl_next_conf = {
         .ml_chroma_fire_boost = 1.35f,
         .ml_chroma_knee = 0.55f,
         .ml_chroma_skin_protect = 0.95f,
+    .ml_chroma_warm_damp   = 0.0f,
         .ml_shadow_strength    = 0.20f,
         .ml_highlight_strength = 0.15f,
         .ml_iir_alpha        = 0.10f,
@@ -1022,6 +1037,7 @@ static void update_options(struct vo *vo)
         update_render_options(vo);
 
     update_lut(p, &p->next_opts->lut);
+    update_skin_lut(p);
     pars->params.lut = p->next_opts->lut.lut;
     pars->params.lut_type = p->next_opts->lut.type;
 
@@ -1207,6 +1223,22 @@ static enum pl_color_primaries get_best_prim_container(const struct pl_raw_prima
 static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
                                      const struct mp_image *mpi);
 
+// True when a model is loaded AND at least one Zion Core grading feature is
+// enabled. Gates feature accumulation + Oracle evaluation: when nothing is
+// on, the ML path must be completely inert (no extraction, no inference).
+static bool ml_features_requested(const struct gl_next_opts *o)
+{
+    return o->ml_model && o->ml_model[0] &&
+         ( o->ml_gamma_mode     != PL_ML_CONTROL_OFF ||
+           o->ml_cr_mode        != PL_ML_CONTROL_OFF ||
+           o->ml_fire_pop_mode  != PL_ML_CONTROL_OFF ||
+           o->ml_radiance_mode  != PL_ML_CONTROL_OFF ||
+           o->ml_chroma_mode    != PL_ML_CONTROL_OFF ||
+           o->ml_shadow_mode    != PL_ML_CONTROL_OFF ||
+           o->ml_highlight_mode != PL_ML_CONTROL_OFF ||
+           o->ml_sdr_emulate );
+}
+
 static void update_ml_context(struct priv *p)
 {
     const char *path = p->next_opts->ml_model;
@@ -1267,12 +1299,18 @@ static void apply_ml_hooks(struct vo *vo, struct priv *p, pl_options pars)
     struct gl_next_opts *opts = p->next_opts;
     if (!opts->ml_model || !opts->ml_model[0] || !p->ml_context)
         return;
+    if (!ml_features_requested(opts))
+        return;
     // Reset hook count to base before appending — prevents unbounded growth.
     pars->params.num_hooks = p->base_num_hooks;
     int num_ml_hooks = pl_ml_render_get_hooks(&p->ml_result, p->ml_hooks);
     for (int i = 0; i < num_ml_hooks; i++)
         MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, &p->ml_hooks[i]);
     pars->params.hooks = p->hooks;
+
+    // Construct CR now runs as a 9×9 bilateral hook (cr_bilateral_hook in
+    // libplacebo) instead of feeding the native contrast_recovery parameter.
+    // The bilateral avoids the expensive get_feature_map downsample pipeline.
 }
 
 // Phase 2 (after render): read the peak-detection buf written by
@@ -1286,6 +1324,12 @@ static void update_ml_render(struct vo *vo, struct priv *p,
     if (!opts->ml_model || !opts->ml_model[0])
         return;
     if (!p->ml_context)
+        return;
+    // All Zion grading disabled (model loaded but every feature off): the ML
+    // path is complete inert — no feature extraction, no Oracle inference,
+    // no IIR, no logging. Prevents the per-frame standalone
+    // pl_extract_ml_features() fallback from running for nothing.
+    if (!ml_features_requested(opts))
         return;
 
     struct pl_frame *source = mix->num_frames > 0 ?
@@ -1319,17 +1363,40 @@ static void update_ml_render(struct vo *vo, struct priv *p,
     float l1max = source->color.hdr.max_pq_y;
     float l1avg = source->color.hdr.avg_pq_y;
 
+    // Probe the renderer's fused accumulator for a per-frame statistic
+    // snapshot. In stats-only mode (hdr-compute-peak=no + ML enabled) the
+    // readback is delayed by one frame, so the cache is empty on frame 1;
+    // deferring evaluation below keeps that single startup frame clean instead
+    // of letting pl_ml_render_evaluate fail + warn.
+    float detected[78] = {0};
+    bool have_features = pl_renderer_get_ml_features(p->rr, target_nits, detected);
+
     // SDR / non-RPU sources carry no L1 metadata (max_pq_y == 0), which
     // starves the scene-cut/IIR engine and reports l1max=0 forever. Fall back
     // to the detected ML features so the temporal engine sees real luma
-    // movement on SDR (Phase B-1). Never triggers for HDR-with-L1 content.
+    // movement on SDR (Phase B-1).
     if (l1max <= 0.0f && l1avg <= 0.0f) {
-        float detected[78];
-        if (pl_renderer_get_ml_features(p->rr, target_nits, detected)) {
+        // Standalone extraction is only an emergency net for renderers whose
+        // fused accumulator genuinely cannot run (compute_peak=yes with no
+        // SSBO/readback support). In stats-only mode the fused accumulator
+        // populates from frame 2 — the ~11ms standalone pass on frame 1 only
+        // buys a startup stall + dropped frames for one stale value.
+        const struct gl_video_opts *vopts = p->opts_cache->opts;
+        bool peak_accum_active = vopts->tone_map.compute_peak >= 0;
+        if (!have_features && source && peak_accum_active) {
+            have_features = pl_extract_ml_features(p->gpu, source,
+                pl_ml_feature_params(.target_nits = target_nits), detected);
+        }
+        if (have_features) {
             l1max = detected[0];   // detected max (signal-domain luma)
             l1avg = detected[1];   // detected average
         }
     }
+
+    // Feature snapshot not yet valid (e.g. frame-1 delayed warmup): keep the
+    // previous frame's result / defaults and defer the Oracle one frame.
+    if (!have_features)
+        return;
     bool scene_cut = false;
 
     // Update slow EMA baseline (alpha = ml_iir_slow_alpha, default 0.05).
@@ -1405,6 +1472,13 @@ static void update_ml_render(struct vo *vo, struct priv *p,
         .chroma_fire_boost    = opts->ml_chroma_fire_boost,
         .chroma_knee          = opts->ml_chroma_knee,
         .chroma_skin_protect  = opts->ml_chroma_skin_protect,
+        .skin_lut              = p->ml_skin_lut,
+        .skin_lut_gpu          = p->gpu,
+        .skin_lut_cr0          = p->ml_skin_lut_cr0,
+        .skin_lut_cr1          = p->ml_skin_lut_cr1,
+        .skin_lut_cb0          = p->ml_skin_lut_cb0,
+        .skin_lut_cb1          = p->ml_skin_lut_cb1,
+        .chroma_warm_damp      = opts->ml_chroma_warm_damp,
         .shadow_model    = p->shadow_context,
         .shadow_mode     = opts->ml_shadow_mode,
         .shadow_strength = opts->ml_shadow_strength,
@@ -1461,6 +1535,8 @@ static void update_ml_render(struct vo *vo, struct priv *p,
             p->ml_iir.cr_strength       = p->ml_result.cr_strength;
             p->ml_iir.radiance_strength = p->ml_result.radiance.strength;
             p->ml_iir.radiance_knee     = p->ml_result.radiance.knee;
+            p->ml_iir.l2_highlight_guard = p->ml_result.l2_highlight_guard;
+            p->ml_iir.l2_midtone_boost  = p->ml_result.l2_midtone_boost;
             p->ml_iir.l1_max_pq         = l1max > 0.01f ? l1max : p->ml_iir.l1_max_pq;
             p->ml_iir.l1_avg_pq         = l1avg > 0.0f  ? l1avg : p->ml_iir.l1_avg_pq;
             p->ml_iir.initialized       = true;
@@ -1470,6 +1546,8 @@ static void update_ml_render(struct vo *vo, struct priv *p,
             p->ml_iir.cr_strength       = A * p->ml_result.cr_strength       + (1.0f-A) * p->ml_iir.cr_strength;
             p->ml_iir.radiance_strength = A * p->ml_result.radiance.strength + (1.0f-A) * p->ml_iir.radiance_strength;
             p->ml_iir.radiance_knee     = A * p->ml_result.radiance.knee     + (1.0f-A) * p->ml_iir.radiance_knee;
+            p->ml_iir.l2_highlight_guard = A * p->ml_result.l2_highlight_guard + (1.0f-A) * p->ml_iir.l2_highlight_guard;
+            p->ml_iir.l2_midtone_boost  = A * p->ml_result.l2_midtone_boost  + (1.0f-A) * p->ml_iir.l2_midtone_boost;
             if (l1max > 0.01f) p->ml_iir.l1_max_pq = l1max;
             if (l1avg > 0.0f)  p->ml_iir.l1_avg_pq = l1avg;
         }
@@ -1486,6 +1564,8 @@ static void update_ml_render(struct vo *vo, struct priv *p,
     p->ml_result.cr_strength          = p->ml_iir.cr_strength;
     p->ml_result.radiance.strength    = p->ml_iir.radiance_strength;
     p->ml_result.radiance.knee        = p->ml_iir.radiance_knee;
+    p->ml_result.l2_highlight_guard   = p->ml_iir.l2_highlight_guard;
+    p->ml_result.l2_midtone_boost    = p->ml_iir.l2_midtone_boost;
 
     int64_t t2 = mp_time_ns();
     // Log ML state + timing (visible with mpv -v)
@@ -2933,6 +3013,9 @@ static void uninit(struct vo *vo)
     pl_ml_context_destroy(&p->ml_context);
     TA_FREEP(&p->ml_model_path);
 
+    pl_tex_destroy(p->gpu, &p->ml_skin_lut);
+    TA_FREEP(&p->ml_skin_lut_path);
+
     for (int i = 0; i < VO_PASS_PERF_MAX; ++i) {
         pl_shader_info_deref(&p->perf_fresh.info[i].shader);
         pl_shader_info_deref(&p->perf_redraw.info[i].shader);
@@ -2998,8 +3081,12 @@ static int preinit(struct vo *vo)
     p->osd_sync = 1;
 
     p->pars = pl_options_alloc(p->pllog);
+    // Load the ML context FIRST so update_render_options()'s stats-only
+    // decision (ml_features_requested && p->ml_context) sees a usable model.
+    // update_render_options() only re-runs on option changes, so an early
+    // NULL context here would freeze peak_detect_params=NULL for the run.
+    update_ml_context(p);            // pre-load XGBoost model before first frame
     update_render_options(vo);
-    update_ml_context(p);  // pre-load XGBoost model before first frame
     return 0;
 
 err_out:
@@ -3186,6 +3273,87 @@ static void update_lut(struct priv *p, struct user_lut *lut)
     talloc_free(lutdata.start);
 }
 
+// Trained P(skin) chroma LUT loader (--ml-chroma-skin-lut). File format:
+//   [f32 cr_lo][f32 cr_hi][f32 cb_lo][f32 cb_hi][u16 w][u16 h] (20 B)
+//   then w*h u8 P(skin) row-major (cb axis = rows, cr axis = cols).
+// Mirrors update_lut: diff the cached path, load on change, (re)create the r8
+// texture owned by p->gpu. Any failure leaves the LUT NULL and the libplacebo
+// hook falls back to the hand-tuned ellipse.
+static void update_skin_lut(struct priv *p)
+{
+    const char *opt = p->next_opts->ml_chroma_skin_lut;
+
+    // GPU re-created (VO reinit) but the texture survived: drop it.
+    if (p->ml_skin_lut && p->ml_skin_lut_gpu != p->gpu) {
+        pl_tex_destroy(p->gpu, &p->ml_skin_lut);
+        MP_WARN(p, "Skin-chroma LUT dropped: stale GPU\n");
+    }
+
+    if (!opt || !opt[0]) {
+        pl_tex_destroy(p->gpu, &p->ml_skin_lut);
+        p->ml_skin_lut_cr0 = p->ml_skin_lut_cr1 = 0.0f;
+        p->ml_skin_lut_cb0 = p->ml_skin_lut_cb1 = 0.0f;
+        TA_FREEP(&p->ml_skin_lut_path);
+        return;
+    }
+    if (p->ml_skin_lut_path && strcmp(p->ml_skin_lut_path, opt) == 0)
+        return; // no change
+
+    pl_tex_destroy(p->gpu, &p->ml_skin_lut);
+    talloc_replace(p, p->ml_skin_lut_path, opt); // cache first: no repeated reads
+
+    char *fname = mp_get_user_path(NULL, p->global, p->ml_skin_lut_path);
+    MP_VERBOSE(p, "Loading skin-chroma LUT '%s'\n", fname);
+    struct bstr data = stream_read_file(fname, NULL, p->global, 1 << 20); // 1 MiB cap
+    talloc_free(fname);
+    const uint8_t *d = data.start;
+
+    if (data.len < 20) {
+        MP_ERR(p, "Skin-chroma LUT too small (%zu bytes)\n", data.len);
+        goto error;
+    }
+    float cr0, cr1, cb0, cb1;
+    memcpy(&cr0, d + 0, 4); memcpy(&cr1, d + 4, 4);
+    memcpy(&cb0, d + 8, 4); memcpy(&cb1, d + 12, 4);
+    int w = d[16] | (d[17] << 8);
+    int h = d[18] | (d[19] << 8);
+    if (w < 4 || w > 8192 || h < 4 || h > 8192 ||
+        data.len != 20 + (size_t)w * (size_t)h || cr1 <= cr0 || cb1 <= cb0) {
+        MP_ERR(p, "Skin-chroma LUT: invalid header (w=%d h=%d len=%zu)\n", w, h, data.len);
+        goto error;
+    }
+
+    pl_fmt fmt = pl_find_fmt(p->gpu, PL_FMT_UNORM, 1, 8, 8,
+                             PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR);
+    if (!fmt)
+        fmt = pl_find_named_fmt(p->gpu, "r8");
+    if (!fmt) {
+        MP_ERR(p, "Skin-chroma LUT: no linear r8 format available\n");
+        goto error;
+    }
+
+    p->ml_skin_lut = pl_tex_create(p->gpu, pl_tex_params(
+        .w = w, .h = h, .format = fmt, .sampleable = true,
+        .host_writable = true, .debug_tag = "ml_skin_lut"));
+    if (!p->ml_skin_lut || !pl_tex_upload(p->gpu, pl_tex_transfer_params(
+            .tex = p->ml_skin_lut, .ptr = d + 20))) {
+        MP_ERR(p, "Skin-chroma LUT: texture create/upload failed\n");
+        goto error;
+    }
+    p->ml_skin_lut_gpu = p->gpu;
+    p->ml_skin_lut_cr0 = cr0; p->ml_skin_lut_cr1 = cr1;
+    p->ml_skin_lut_cb0 = cb0; p->ml_skin_lut_cb1 = cb1;
+    MP_INFO(p, "Skin-chroma LUT loaded: %dx%d cr[%.3f,%.3f] cb[%.3f,%.3f]\n",
+            w, h, cr0, cr1, cb0, cb1);
+    talloc_free(data.start);
+    return;
+error:
+    pl_tex_destroy(p->gpu, &p->ml_skin_lut);
+    p->ml_skin_lut_cr0 = p->ml_skin_lut_cr1 = 0.0f;
+    p->ml_skin_lut_cb0 = p->ml_skin_lut_cb1 = 0.0f;
+    talloc_free(data.start);
+}
+
 static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
                                      const struct mp_image *mpi)
 {
@@ -3365,7 +3533,15 @@ static void update_render_options(struct vo *vo)
     pars->sigmoid_params.center = opts->sigmoid_center;
     pars->sigmoid_params.slope = opts->sigmoid_slope;
 
-    pars->params.peak_detect_params = opts->tone_map.compute_peak >= 0 ? &pars->peak_detect_params : NULL;
+    // Peak detection / frame-stats accumulation. Adaptive tone mapping only when
+    // --hdr-compute-peak says so; stats-only collection when the ML pipeline
+    // needs features but adaptive mapping is off. When neither, the accumulation
+    // pass is not configured at all (peak_detect_params == NULL).
+    bool peak_on  = opts->tone_map.compute_peak >= 0;
+    bool ml_wants = ml_features_requested(p->next_opts) && p->ml_context;
+    pars->params.peak_detect_params =
+        (peak_on || ml_wants) ? &pars->peak_detect_params : NULL;
+    pars->peak_detect_params.stats_only = ml_wants && !peak_on;
     pars->peak_detect_params.smoothing_period = opts->tone_map.decay_rate;
     pars->peak_detect_params.scene_threshold_low = opts->tone_map.scene_threshold_low;
     pars->peak_detect_params.scene_threshold_high = opts->tone_map.scene_threshold_high;
@@ -3407,7 +3583,18 @@ AV_NOWARN_DEPRECATED(
         pars->color_map_params.tone_mapping_param = 0.0;
 )
     pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
-    pars->color_map_params.contrast_recovery = opts->tone_map.contrast_recovery;
+    // The native contrast_recovery runs INSIDE the tone mapping pass and
+    // preserves local contrast that the global spline curve destroys — the
+    // ML bilateral hook (AFTER tone mapping) cannot fully recover a flat base.
+    // When any Zion Core feature is active (model loaded) and the app has
+    // zeroed out hdr-contrast-recovery, inject a 0.20 baseline so the spline
+    // output retains local contrast for downstream ML hooks to build on.
+    {
+        float base_cr = opts->tone_map.contrast_recovery;
+        if (p->ml_context && base_cr == 0.0f)
+            base_cr = 0.20f;
+        pars->color_map_params.contrast_recovery = base_cr;
+    }
     pars->color_map_params.visualize_lut = opts->tone_map.visualize;
     pars->color_map_params.contrast_smoothness = opts->tone_map.contrast_smoothness;
     pars->color_map_params.gamut_mapping = gamut_modes[opts->tone_map.gamut_mode];
