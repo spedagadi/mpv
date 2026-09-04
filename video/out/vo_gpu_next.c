@@ -190,7 +190,7 @@ struct priv {
     const struct pl_hook **hooks; // storage for `params.hooks`
     const struct pl_hook **active_hooks;
     int base_num_hooks;           // hook count after GLSL shaders, before ML hooks
-    struct pl_hook ml_hooks[8];   // SDR→P5, shadow, fire, L2, CR bilateral, radiance, chroma, highlight
+    struct pl_hook ml_hooks[16];  // SDR→P5, pq-precompress, vec-desat, detail-enh, shadow, fire, cr-capture, L2, cr-fmap, radiance, chroma, highlight, headroom, disp-compress
     int render_frame_cnt;        // frames rendered (VP acq warm-up hold)
 
     // VP present-gate (--ml-acq-cutover): hold black until a frame younger
@@ -253,7 +253,6 @@ struct priv {
         float radiance_strength;
         float radiance_knee;
         float l2_highlight_guard;
-        float l2_midtone_boost;
     } ml_iir;
 
     struct pl_icc_params icc_params;
@@ -311,8 +310,14 @@ struct gl_next_opts {
     float ml_chroma_fire_boost;
     float ml_chroma_knee;
     float ml_chroma_skin_protect;
-    float ml_chroma_warm_damp;      // [0..1] warm-sector chroma-gain pullback
+    float ml_hue_correction;        // post-TM hue rotation (degrees, -15..+15)
+    float ml_hunt;                  // Hunt effect compensation (0..1, default 0.42)
+    float ml_hi_desat;              // highlight desat ceiling (0..0.50, default 0.18)
     char *ml_chroma_skin_lut;       // trained P(skin) chroma LUT (.bin), M_OPT_FILE
+    float ml_headroom;              // highlight headroom (-1=auto, 0..0.30)
+    float ml_hdr_detail;            // HDR texture recovery injection strength (0..1)
+    float ml_vector_desat;          // pre-TM highlight desaturation (0..0.6)
+    float ml_virtual_peak;          // two-stage TM: virtual target nits (0=off)
     float ml_iir_alpha;
     float ml_scene_cut;
     float ml_gamma_max_delta;  // hard cap on gamma change per frame (0=disabled)
@@ -320,6 +325,7 @@ struct gl_next_opts {
     bool ml_sdr_emulate;       // SDR→P5 virtual-master bridge (PL_HOOK_RGB_INPUT)
     float ml_sdr_virtual_nits; // virtual P5 ceiling for the emulation (nits)
     float ml_sdr_strength;   // shaped mid-lift strength (0..1) for the bridge
+    float ml_dehaze;         // shadow crush strength (0..1, -1=auto)
     bool ml_acq_warm_hold;     // VP acq: present black until ML/shaders warm
     int  ml_acq_warm_frames;   // min frames rendered before the hold releases
     int  ml_acq_stats;         // VP latency histogram: seconds to collect (0=off)
@@ -373,13 +379,13 @@ const struct m_sub_options gl_next_conf = {
         {"ml-shadow-model",    OPT_STRING(ml_shadow_model),    .flags = M_OPT_FILE},
         {"ml-highlight-model", OPT_STRING(ml_highlight_model), .flags = M_OPT_FILE},
         {"ml-shadow",    OPT_CHOICE(ml_shadow_mode,    {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
-        {"ml-shadow-strength",    OPT_FLOAT(ml_shadow_strength),    M_RANGE(0.0, 0.5)},
+        {"ml-shadow-strength",    OPT_FLOAT(ml_shadow_strength),    M_RANGE(0.0, 1.0)},
         {"ml-highlight",    OPT_CHOICE(ml_highlight_mode,    {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
         {"ml-highlight-strength", OPT_FLOAT(ml_highlight_strength), M_RANGE(0.0, 0.4)},
         {"ml-gamma", OPT_CHOICE(ml_gamma_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
         {"ml-gamma-value", OPT_FLOAT(ml_gamma), M_RANGE(0.5, 1.5)},
         {"ml-cr", OPT_CHOICE(ml_cr_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
-        {"ml-cr-strength", OPT_FLOAT(ml_cr_strength), M_RANGE(0, 0.5)},
+        {"ml-cr-strength", OPT_FLOAT(ml_cr_strength), M_RANGE(0, 1.0)},
         {"ml-fire-pop", OPT_CHOICE(ml_fire_pop_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
         {"ml-fire-pop-strength", OPT_FLOAT(ml_fire_pop_strength), M_RANGE(0, 2)},
         {"ml-radiance", OPT_CHOICE(ml_radiance_mode, {"off", PL_ML_CONTROL_OFF}, {"auto", PL_ML_CONTROL_AUTO}, {"manual", PL_ML_CONTROL_MANUAL})},
@@ -392,7 +398,13 @@ const struct m_sub_options gl_next_conf = {
         {"ml-chroma-knee", OPT_FLOAT(ml_chroma_knee), M_RANGE(0.1, 0.9)},
         {"ml-chroma-skin", OPT_FLOAT(ml_chroma_skin_protect), M_RANGE(0.5, 1.0)},
         {"ml-chroma-skin-lut", OPT_STRING(ml_chroma_skin_lut), .flags = M_OPT_FILE},
-        {"ml-chroma-warm-damp", OPT_FLOAT(ml_chroma_warm_damp), M_RANGE(0.0, 1.0)},
+        {"ml-hue-correction",  OPT_FLOAT(ml_hue_correction),  M_RANGE(-15.0, 15.0)},
+        {"ml-hunt",            OPT_FLOAT(ml_hunt),            M_RANGE(0.0, 1.0)},
+        {"ml-hi-desat",        OPT_FLOAT(ml_hi_desat),        M_RANGE(0.0, 0.50)},
+        {"ml-headroom",        OPT_FLOAT(ml_headroom),        M_RANGE(-1.0, 0.30)},
+        {"ml-hdr-detail",      OPT_FLOAT(ml_hdr_detail),      M_RANGE(0.0, 1.0)},
+        {"ml-vector-desat",    OPT_FLOAT(ml_vector_desat),     M_RANGE(0.0, 0.6)},
+        {"ml-virtual-peak",    OPT_FLOAT(ml_virtual_peak),     M_RANGE(0.0, 400.0)},
         {"ml-iir-alpha",       OPT_FLOAT(ml_iir_alpha),       M_RANGE(0.0, 1.0)},
         {"ml-scene-cut",       OPT_FLOAT(ml_scene_cut),       M_RANGE(0.0, 0.5)},
         {"ml-gamma-max-delta", OPT_FLOAT(ml_gamma_max_delta), M_RANGE(0.0, 0.20)},
@@ -400,6 +412,7 @@ const struct m_sub_options gl_next_conf = {
         {"ml-emulate-sdr",     OPT_BOOL(ml_sdr_emulate)},
         {"ml-sdr-virtual-nits", OPT_FLOAT(ml_sdr_virtual_nits), M_RANGE(100.0, 4000.0)},
         {"ml-sdr-strength",     OPT_FLOAT(ml_sdr_strength),     M_RANGE(0.0, 1.0)},
+        {"ml-dehaze",           OPT_FLOAT(ml_dehaze),           M_RANGE(-1.0, 1.0)},
         {"ml-acq-warm-hold",     OPT_BOOL(ml_acq_warm_hold)},
         {"ml-acq-warm-frames",   OPT_INT(ml_acq_warm_frames), M_RANGE(1, 240)},
         {"ml-acq-stats",         OPT_INT(ml_acq_stats), M_RANGE(0, 600)},
@@ -424,6 +437,7 @@ const struct m_sub_options gl_next_conf = {
         .ml_radiance_shoulder = 0.82f,
         .ml_sdr_virtual_nits  = 1000.0f,
         .ml_sdr_strength     = 0.5f,
+        .ml_dehaze           = -1.0f,
         .ml_acq_warm_frames  = 5,
         .ml_acq_stats        = 0,
         .ml_acq_cutover      = 0,
@@ -431,9 +445,15 @@ const struct m_sub_options gl_next_conf = {
         .ml_chroma_fire_boost = 1.35f,
         .ml_chroma_knee = 0.55f,
         .ml_chroma_skin_protect = 0.95f,
-    .ml_chroma_warm_damp   = 0.0f,
+        .ml_hue_correction     = 0.0f,
+        .ml_hunt               = 0.80f,
+        .ml_hi_desat           = 0.12f,
         .ml_shadow_strength    = 0.20f,
         .ml_highlight_strength = 0.15f,
+        .ml_headroom         = -1.0f,
+        .ml_hdr_detail       = 0.50f,
+        .ml_vector_desat     = 0.40f,
+        .ml_virtual_peak     = 0.0f,
         .ml_iir_alpha        = 0.10f,
         .ml_scene_cut        = 0.15f,
         .ml_gamma_max_delta  = 0.02f,  // deadband: predictions within 2% ignored
@@ -1107,6 +1127,11 @@ static void apply_target_options(struct priv *p, struct pl_frame *target,
         !pl_color_transfer_is_hdr(target->color.transfer)) {
         target->color.hdr.max_luma = opts->hdr_reference_white;
     }
+    if (p->next_opts->ml_virtual_peak > 0.0f &&
+        p->next_opts->ml_virtual_peak > target->color.hdr.max_luma)
+    {
+        target->color.hdr.max_luma = p->next_opts->ml_virtual_peak;
+    }
     if ((!target->color.hdr.min_luma || !hint))
         apply_target_contrast(p, &target->color, min_luma);
     if (opts->target_gamut) {
@@ -1308,9 +1333,9 @@ static void apply_ml_hooks(struct vo *vo, struct priv *p, pl_options pars)
         MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, &p->ml_hooks[i]);
     pars->params.hooks = p->hooks;
 
-    // Construct CR now runs as a 9×9 bilateral hook (cr_bilateral_hook in
-    // libplacebo) instead of feeding the native contrast_recovery parameter.
-    // The bilateral avoids the expensive get_feature_map downsample pipeline.
+    // Construct CR runs as a two-hook pair (cr_capture + cr_feature_map) that
+    // compares the signal before/after Oracle gamma to restore lost local contrast.
+    // When active, native contrast_recovery is zeroed to prevent double processing.
 }
 
 // Phase 2 (after render): read the peak-detection buf written by
@@ -1337,12 +1362,10 @@ static void update_ml_render(struct vo *vo, struct priv *p,
     if (!source)
         return;
 
-    // Get target display nits from the render target frame's HDR metadata
-    float target_nits = 0.0f;
-    if (target && target->color.hdr.max_luma > 0.0f)
-        target_nits = target->color.hdr.max_luma;
-    if (target_nits <= 0.0f)
-        target_nits = 203.0f; // SDR reference white
+    // Get REAL display nits for ML model — use the user's target_peak (not
+    // the virtual override) so the Oracle sees actual display capability.
+    const struct gl_video_opts *vopts = p->opts_cache->opts;
+    float target_nits = vopts->target_peak > 0.0f ? vopts->target_peak : 203.0f;
 
     // ── Adaptive Temporal Inertia (Anti-Flicker Engine) ──────────────────────
     //
@@ -1478,13 +1501,19 @@ static void update_ml_render(struct vo *vo, struct priv *p,
         .skin_lut_cr1          = p->ml_skin_lut_cr1,
         .skin_lut_cb0          = p->ml_skin_lut_cb0,
         .skin_lut_cb1          = p->ml_skin_lut_cb1,
-        .chroma_warm_damp      = opts->ml_chroma_warm_damp,
+        .hue_correction        = opts->ml_hue_correction,
+        .hunt_compensation     = opts->ml_hunt,
+        .highlight_desat       = opts->ml_hi_desat,
         .shadow_model    = p->shadow_context,
         .shadow_mode     = opts->ml_shadow_mode,
         .shadow_strength = opts->ml_shadow_strength,
         .highlight_model    = p->highlight_context,
         .highlight_mode     = opts->ml_highlight_mode,
         .highlight_strength = opts->ml_highlight_strength,
+        .headroom           = opts->ml_headroom,
+        .hdr_detail         = opts->ml_hdr_detail,
+        .vector_desat       = opts->ml_vector_desat,
+        .virtual_target_nits  = opts->ml_virtual_peak,
         .target_nits          = target_nits,
         .l1_max_pq            = l1max,
         .l1_avg_pq            = l1avg,
@@ -1492,6 +1521,7 @@ static void update_ml_render(struct vo *vo, struct priv *p,
         .emulate_sdr          = opts->ml_sdr_emulate,
         .sdr_virtual_nits     = opts->ml_sdr_virtual_nits,
         .sdr_strength         = opts->ml_sdr_strength,
+        .dehaze               = opts->ml_dehaze,
         .renderer             = p->rr,
     };
 
@@ -1503,6 +1533,8 @@ static void update_ml_render(struct vo *vo, struct priv *p,
     int64_t t1 = mp_time_ns();
     MP_TRACE(vo, "ML timing: pl_ml_render_evaluate=%.2f ms\n",
              (t1 - t0) / 1e6);
+
+
 
     // XGBoost dead-zone deadband: if new gamma prediction is within
     // ml_gamma_max_delta of the current IIR value (and not a scene cut),
@@ -1536,7 +1568,6 @@ static void update_ml_render(struct vo *vo, struct priv *p,
             p->ml_iir.radiance_strength = p->ml_result.radiance.strength;
             p->ml_iir.radiance_knee     = p->ml_result.radiance.knee;
             p->ml_iir.l2_highlight_guard = p->ml_result.l2_highlight_guard;
-            p->ml_iir.l2_midtone_boost  = p->ml_result.l2_midtone_boost;
             p->ml_iir.l1_max_pq         = l1max > 0.01f ? l1max : p->ml_iir.l1_max_pq;
             p->ml_iir.l1_avg_pq         = l1avg > 0.0f  ? l1avg : p->ml_iir.l1_avg_pq;
             p->ml_iir.initialized       = true;
@@ -1547,7 +1578,6 @@ static void update_ml_render(struct vo *vo, struct priv *p,
             p->ml_iir.radiance_strength = A * p->ml_result.radiance.strength + (1.0f-A) * p->ml_iir.radiance_strength;
             p->ml_iir.radiance_knee     = A * p->ml_result.radiance.knee     + (1.0f-A) * p->ml_iir.radiance_knee;
             p->ml_iir.l2_highlight_guard = A * p->ml_result.l2_highlight_guard + (1.0f-A) * p->ml_iir.l2_highlight_guard;
-            p->ml_iir.l2_midtone_boost  = A * p->ml_result.l2_midtone_boost  + (1.0f-A) * p->ml_iir.l2_midtone_boost;
             if (l1max > 0.01f) p->ml_iir.l1_max_pq = l1max;
             if (l1avg > 0.0f)  p->ml_iir.l1_avg_pq = l1avg;
         }
@@ -1559,13 +1589,16 @@ static void update_ml_render(struct vo *vo, struct priv *p,
     // Write IIR-smoothed values back into ml_result so apply_ml_hooks()
     // renders with the temporally-stable values, not the raw Oracle prediction.
     // Without this, all the adaptive alpha / deadband work is a no-op on screen.
-    p->ml_result.gamma    = p->ml_iir.gamma;
-    p->ml_result.l2_power = 2048.0f / fmaxf(p->ml_iir.gamma, 0.1f);
+    // Guard: only overwrite gamma when the Oracle actually ran. When gamma is
+    // OFF and IIR was never initialized, iir.gamma=0 would poison l2_power.
+    if (oracle_active && p->ml_iir.initialized) {
+        p->ml_result.gamma    = p->ml_iir.gamma;
+        p->ml_result.l2_power = 2048.0f / fmaxf(p->ml_iir.gamma, 0.1f);
+    }
     p->ml_result.cr_strength          = p->ml_iir.cr_strength;
     p->ml_result.radiance.strength    = p->ml_iir.radiance_strength;
     p->ml_result.radiance.knee        = p->ml_iir.radiance_knee;
     p->ml_result.l2_highlight_guard   = p->ml_iir.l2_highlight_guard;
-    p->ml_result.l2_midtone_boost    = p->ml_iir.l2_midtone_boost;
 
     int64_t t2 = mp_time_ns();
     // Log ML state + timing (visible with mpv -v)
@@ -1575,7 +1608,11 @@ static void update_ml_render(struct vo *vo, struct priv *p,
     if (ml_log_ctr++ % 30 == 0)
         MP_INFO(vo, "ML: gamma=%.3f(%s) cr=%.3f(%s) rad=%.3f@%.2f(%s) "
                "chroma=%s fire=%.2f iir=%.2f l1max=%.4f "
-               "shad=%.3f@%.2f hi=%.3f@%.2f  [eval=%.1fms iir=%.1fms]\n",
+               "shad_toe=%.3f shad_bi=%.3f@%.2f "
+               "hi_roll=%+.3f hi_bi=%.3f@%.2f "
+               "hdr=%.3f dehaze=%.2f "
+               "dc_pq=%.4f dc_gain=%.2f "
+               "[eval=%.1fms iir=%.1fms]\n",
                p->ml_result.gamma,
                p->ml_result.model_used ? "model" : "fallback",
                p->ml_result.cr_strength,
@@ -1587,8 +1624,14 @@ static void update_ml_render(struct vo *vo, struct priv *p,
                opts->ml_chroma_mode == PL_ML_CONTROL_OFF ? "off" :
                opts->ml_chroma_mode == PL_ML_CONTROL_AUTO ? "auto" : "manual",
                opts->ml_fire_pop_strength, A, l1max,
+               p->ml_result.shadow_toe,
                p->ml_result.shadow_strength, p->ml_result.shadow_knee,
+               p->ml_result.highlight_rolloff,
                p->ml_result.highlight_strength, p->ml_result.highlight_knee,
+               p->ml_result.headroom,
+               p->ml_result.dehaze_strength,
+               p->ml_result.dc_ceiling_pq,
+               p->ml_result.dc_compress_gain,
                (t1 - t0) / 1e6, (t2 - t1) / 1e6);
 
     // SDR→P5 emulation observability — log when the bridge (or its calibration
@@ -3583,20 +3626,20 @@ AV_NOWARN_DEPRECATED(
         pars->color_map_params.tone_mapping_param = 0.0;
 )
     pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
-    // The native contrast_recovery runs INSIDE the tone mapping pass and
-    // preserves local contrast that the global spline curve destroys — the
-    // ML bilateral hook (AFTER tone mapping) cannot fully recover a flat base.
-    // When any Zion Core feature is active (model loaded) and the app has
-    // zeroed out hdr-contrast-recovery, inject a 0.20 baseline so the spline
-    // output retains local contrast for downstream ML hooks to build on.
+    // Construct CR (Oracle feature-map) and native CR are mutually exclusive.
+    // When Construct CR is active it handles contrast recovery post-Oracle;
+    // native CR is zeroed to prevent double processing.
     {
         float base_cr = opts->tone_map.contrast_recovery;
-        if (p->ml_context && base_cr == 0.0f)
-            base_cr = 0.20f;
+        if (p->ml_context && p->next_opts->ml_cr_mode != PL_ML_CONTROL_OFF)
+            base_cr = 0.0f;
+        else if (p->ml_context && base_cr == 0.0f)
+            base_cr = 0.30f;
         pars->color_map_params.contrast_recovery = base_cr;
     }
     pars->color_map_params.visualize_lut = opts->tone_map.visualize;
     pars->color_map_params.contrast_smoothness = opts->tone_map.contrast_smoothness;
+    pars->color_map_params.warm_desat = opts->tone_map.warm_desat;
     pars->color_map_params.gamut_mapping = gamut_modes[opts->tone_map.gamut_mode];
 
     pars->params.dither_params = NULL;
